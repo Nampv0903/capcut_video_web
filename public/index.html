@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LMautoedit</title>
+  <meta name="description" content="LMautoedit — Tự động ghép video và ảnh theo mẫu CapCut giữ nguyên 100% chữ và hiệu ứng gốc." />
+  <link rel="icon" type="image/png" href="/favicon.png?v=20261028_12" />
+  <link rel="apple-touch-icon" href="/logo.png?v=20261028_12" />
+  <link rel="stylesheet" href="/index.css?v=20261029_19" />
+</head>
+<body>
+  <div class="pin-lock-overlay" id="pin-lock-overlay" style="display: none;">
+    <div class="pin-lock-card" id="pin-lock-card">
+      <div class="pin-lock-logo">
+        <img src="/logo.png?v=20261028_12" alt="LMautoedit" />
+      </div>
+      <div class="pin-lock-brand">
+        <span class="wordmark-lm">LM</span><span class="wordmark-video">autoedit</span><span class="wordmark-dot"></span>
+      </div>
+      <p class="pin-lock-sub">Nhập mã PIN bảo mật để truy cập hệ thống</p>
+
+      <form id="pin-lock-form" class="pin-lock-form" autocomplete="off">
+        <input
+          type="password"
+          id="pin-input-field"
+          class="pin-input-field"
+          inputmode="numeric"
+          maxlength="6"
+          placeholder="• • • • • •"
+          autofocus
+        />
+        <div class="pin-error-msg" id="pin-error-msg"></div>
+        <button type="submit" class="btn btn-primary pin-submit-btn" id="btn-pin-submit">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+          </svg>
+          <span>Mở Khóa Hệ Thống</span>
+        </button>
+      </form>
+    </div>
+  </div>
+  <!-- Top Bar -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-logo" aria-hidden="true">
+        <img src="/logo.png?v=20261028_12" alt="LMautoedit Logo" class="brand-logo-img" />
+      </div>
+      <div class="brand-text">
+        <h1 class="brand-wordmark">
+          <span class="wordmark-lm">LM</span><span class="wordmark-video">autoedit</span><span class="wordmark-dot" aria-hidden="true"></span>
+        </h1>
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <div class="status-pill" id="ws-status-pill">
+        <span class="status-dot"></span>
+        <span id="ws-status-text">Đang hoạt động</span>
+      </div>
+      <button class="btn" id="btn-capcut-login">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+          <circle cx="12" cy="7" r="4"></circle>
+        </svg>
+        <span>Tài khoản CapCut</span>
+      </button>
+      <button class="btn" id="btn-lock-system" title="Khóa màn hình bằng mã PIN">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- Main 3-Column Studio Workspace -->
+  <main class="studio-layout">
+    <!-- COLUMN 1: TEMPLATE SOURCE -->
+    <section class="panel col-left" aria-labelledby="step1-heading">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="step-badge">01</span>
+          <h2 id="step1-heading">Chọn Mẫu Video</h2>
+        </div>
+      </div>
+
+      <!-- URL Analyzer Input -->
+      <div class="input-group">
+        <label class="input-label" for="input-template-url">
+          <span>Link mẫu CapCut</span>
+        </label>
+        <div class="url-input-row">
+          <input
+            type="text"
+            id="input-template-url"
+            class="text-input"
+            placeholder="Dán link mẫu CapCut vào đây..."
+          />
+          <button class="btn btn-primary" id="btn-analyze-url">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+            <span>Thêm mẫu</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Active Selected Template Summary -->
+      <div class="active-template-box" id="active-template-box">
+        <div style="display: flex; align-items: center; justify-content: space-between;">
+          <span class="active-template-eyebrow">Mẫu đang chọn</span>
+          <button class="btn" id="btn-preview-template" style="padding: 4px 9px; font-size: 12.5px; display: none;">
+            <svg class="icon" style="width: 12px; height: 12px;" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+            <span>Xem mẫu</span>
+          </button>
+        </div>
+        <div class="active-template-title" id="active-template-title">Chưa chọn mẫu CapCut</div>
+        <div class="active-template-stats" id="active-template-stats" style="display: none;">
+          <span class="tag-chip" id="stat-slot-count">0 phân đoạn</span>
+          <span class="tag-chip" id="stat-duration">0s</span>
+          <span class="tag-chip" id="stat-resolution">1080x1920</span>
+        </div>
+      </div>
+
+      <!-- Saved Templates List -->
+      <div class="input-group" style="flex: 1; overflow: hidden;">
+        <div class="input-label">
+          <span>Danh sách mẫu đã lưu</span>
+          <span id="template-count-label" style="font-family: 'JetBrains Mono', monospace;">0 mẫu</span>
+        </div>
+        <div class="template-list" id="template-list"></div>
+      </div>
+    </section>
+
+    <!-- COLUMN 2: SYNCHRONIZED MULTI-FILE SLOT MATRIX & PARALLEL ENGINE -->
+    <section class="panel col-center" aria-labelledby="step2-heading">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="step-badge">02</span>
+          <h2 id="step2-heading">Tải Video và Ảnh</h2>
+        </div>
+        <div style="display: flex; gap: 6px;">
+          <button class="btn" id="btn-add-slot" style="display: none;">
+            <span>Thêm đoạn</span>
+          </button>
+          <button class="btn btn-ghost-danger" id="btn-clear-clips" style="padding: 6px 12px; font-size: 13.5px; color: #f87171; border-color: rgba(239, 68, 68, 0.35); background: rgba(239, 68, 68, 0.08);">
+            <svg class="icon" style="width: 15px; height: 15px; color: #ef4444;" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>
+              <path d="M10 11v6"></path>
+              <path d="M14 11v6"></path>
+            </svg>
+            <span>Làm mới file</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Synchronized Pair Status Banner (Hidden per user preference) -->
+      <div class="sync-banner" id="sync-pair-status" style="display: none;"></div>
+
+      <!-- Parallel Slot Columns Matrix -->
+      <div class="slots-timeline" id="slots-timeline"></div>
+
+      <!-- Progress Bar (Only shown while actively rendering) -->
+      <div class="progress-wrapper" id="progress-wrapper" style="display: none;">
+        <div class="progress-header">
+          <span id="progress-status-text">Đang tạo video...</span>
+          <span class="progress-pct" id="progress-percent-text">0%</span>
+        </div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progress-bar-fill"></div>
+        </div>
+      </div>
+
+      <!-- Primary Render CTA -->
+      <button class="btn btn-render-mega" id="btn-start-render">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+          <polygon points="5 3 19 12 5 21 5 3"></polygon>
+        </svg>
+        <span id="btn-start-render-label">Tạo Video Ngay</span>
+      </button>
+    </section>
+
+    <!-- COLUMN 3: PREVIEW, OUTPUTS & SYSTEM LOGS -->
+    <section class="panel col-right" aria-labelledby="step3-heading">
+      <div class="panel-header">
+        <div class="panel-title-group">
+          <span class="step-badge">03</span>
+          <h2 id="step3-heading">Xem Trước và Tải Video</h2>
+        </div>
+        <div style="display: flex; gap: 6px; align-items: center;">
+          <button id="btn-download-all-batch" class="btn" type="button" style="padding: 5px 10px; font-size: 12.5px; display: none;">
+            <svg class="icon" style="width: 13px; height: 13px;" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <span id="btn-download-all-label">Tải tất cả</span>
+          </button>
+          <a id="btn-download-latest" class="btn btn-primary" href="#" download style="padding: 5px 11px; font-size: 13px; display: none;">
+            <svg class="icon" style="width: 13px; height: 13px;" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+            <span>Tải video</span>
+          </a>
+        </div>
+      </div>
+
+      <!-- Video / Bot Live Preview Stage -->
+      <div class="preview-stage" id="preview-stage">
+        <span class="preview-badge" id="preview-badge">Xem trước</span>
+        <video id="main-preview-video" controls playsinline loop></video>
+        <img id="bot-live-screenshot" alt="Tiến trình xử lý ngầm" style="display: none;" />
+      </div>
+
+      <!-- Rendered Outputs Gallery -->
+      <div class="input-group" style="flex: 1; overflow: hidden;">
+        <div class="outputs-header-bar">
+          <div class="outputs-header-left">
+            <span id="outputs-title-label" class="outputs-header-title">Danh sách video đã tạo</span>
+            <span id="outputs-count-label" class="slot-count-badge">0 video</span>
+          </div>
+          <button id="btn-clear-outputs" class="btn btn-clear-outputs" type="button" title="Xóa danh sách video đã tạo của mẫu này">
+            <svg class="icon" style="color: #ef4444; width: 13px; height: 13px;" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+              <polyline points="3 6 5 6 21 6"></polyline>
+              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+            </svg>
+            <span>Xóa danh sách</span>
+          </button>
+        </div>
+        <div class="outputs-list" id="outputs-list"></div>
+      </div>
+
+      <!-- Compact System Logs (Hidden per user preference) -->
+      <div class="input-group" style="display: none;">
+        <div class="input-label">
+          <span>Nhật ký hệ thống</span>
+          <button class="btn" id="btn-clear-logs" style="padding: 2px 7px; font-size: 10.5px;">Xóa</button>
+        </div>
+        <div class="terminal-box" id="terminal-logs"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Video Trimmer Modal (Bảng Cắt Video Nguyên Liệu) -->
+  <div class="trim-modal-overlay" id="video-trim-modal" style="display: none;">
+    <div class="trim-modal-card">
+      <div class="trim-modal-header">
+        <div class="trim-modal-title-group">
+          <span class="trim-scissor-badge">✂ Cắt Video</span>
+          <h3 id="trim-modal-filename">video.mp4</h3>
+        </div>
+        <button type="button" class="trim-close-btn" id="btn-trim-close" title="Đóng">✕</button>
+      </div>
+
+      <div class="trim-video-stage">
+        <video id="trim-modal-video" playsinline></video>
+      </div>
+
+      <div class="trim-controls-panel">
+        <div class="trim-time-badges">
+          <div class="trim-stat-pill">
+            <span class="trim-stat-label">Điểm đầu:</span>
+            <span class="trim-stat-val" id="trim-start-label">0.0s</span>
+          </div>
+          <div class="trim-stat-pill highlight">
+            <span class="trim-stat-label">Độ dài giữ lại:</span>
+            <span class="trim-stat-val" id="trim-duration-label">0.0s</span>
+            <span class="trim-slot-target" id="trim-slot-target-label"></span>
+          </div>
+          <div class="trim-stat-pill">
+            <span class="trim-stat-label">Điểm cuối:</span>
+            <span class="trim-stat-val" id="trim-end-label">0.0s</span>
+          </div>
+        </div>
+
+        <!-- Dual Handle Range Slider -->
+        <div class="trim-slider-container">
+          <div class="trim-track-bg">
+            <div class="trim-cut-overlay left" id="trim-cut-left"></div>
+            <div class="trim-active-fill" id="trim-active-fill"></div>
+            <div class="trim-cut-overlay right" id="trim-cut-right"></div>
+          </div>
+          <input type="range" id="trim-range-start" class="trim-range-input" min="0" max="10" step="0.05" value="0" />
+          <input type="range" id="trim-range-end" class="trim-range-input" min="0" max="10" step="0.05" value="10" />
+        </div>
+        <div class="trim-hint-text">Kéo thanh trượt trái để cắt bỏ đoạn đầu · Kéo thanh trượt phải để cắt bỏ đoạn cuối</div>
+      </div>
+
+      <div class="trim-modal-footer">
+        <button type="button" class="btn" id="btn-trim-preview">
+          <span>▶ Xem thử đoạn cắt</span>
+        </button>
+        <div style="display: flex; gap: 8px;">
+          <button type="button" class="btn" id="btn-trim-cancel">Hủy</button>
+          <button type="button" class="btn btn-primary" id="btn-trim-save">
+            <span>✂ Lưu đoạn cắt</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Image Preview Lightbox Modal (Xem Ảnh Rõ Nét) -->
+  <div class="trim-modal-overlay" id="image-preview-modal" style="display: none;">
+    <div class="trim-modal-card image-modal-card">
+      <div class="trim-modal-header">
+        <div class="trim-modal-title-group">
+          <span class="trim-scissor-badge" style="color: #a855f7; border-color: rgba(168, 85, 247, 0.35); background: rgba(168, 85, 247, 0.14);">ẢNH</span>
+          <h3 id="image-modal-filename">image.jpg</h3>
+        </div>
+        <button type="button" class="trim-close-btn" id="btn-image-modal-close" title="Đóng">✕</button>
+      </div>
+      <div class="image-modal-stage">
+        <img id="image-modal-img" src="" alt="Preview" />
+      </div>
+    </div>
+  </div>
+
+  <!-- Overwrite Existing Videos Notification Modal -->
+  <div class="trim-modal-overlay" id="overwrite-confirm-modal" style="display: none; z-index: 10050;">
+    <div class="trim-modal-card" style="max-width: 460px; border: 1px solid rgba(255, 255, 255, 0.14); box-shadow: 0 24px 60px rgba(0, 0, 0, 0.75);">
+      <div class="trim-modal-header" style="border-bottom: 1px solid rgba(255, 255, 255, 0.08);">
+        <div class="trim-modal-title-group">
+          <h3 id="overwrite-modal-title" style="margin: 0; font-size: 15px;">Thông báo</h3>
+        </div>
+        <button type="button" class="trim-close-btn" id="btn-overwrite-modal-close" title="Đóng">✕</button>
+      </div>
+      <div style="padding: 16px 20px; color: #e2e8f0; font-size: 13.5px; line-height: 1.55;">
+        <p id="overwrite-modal-desc" style="margin: 0 0 10px 0;"></p>
+        <div id="overwrite-modal-list" style="max-height: 140px; overflow-y: auto; background: rgba(15, 23, 42, 0.75); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 8px; padding: 8px 12px; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #cbd5e1;"></div>
+      </div>
+      <div class="trim-modal-footer" style="justify-content: flex-end; gap: 8px;">
+        <button type="button" class="btn" id="btn-overwrite-cancel">Hủy</button>
+        <button type="button" class="btn btn-primary" id="btn-overwrite-confirm">
+          <span>Tạo lại &amp; ghi đè</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js?v=20261029_35"></script>
+</body>
+</html>

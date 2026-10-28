@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "CapCut Auto Template Bridge (Localhost Studio)",
+  "version": "1.0.0",
+  "description": "Cầu nối tự động bơm Video & Ảnh từ localhost:3000 vào tab CapCut Web đang mở sẵn trên trình duyệt chính của đại ca.",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "http://localhost:3000/*",
+    "https://*.capcut.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://*.capcut.com/editor-template*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

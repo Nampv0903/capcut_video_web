@@ -1,0 +1,12 @@
+node_modules/
+chrome_profile/
+outputs/
+uploads/
+cache/render_jobs/
+cache/temp/
+cache/uploads_meta.json
+cache/outputs_state.json
+**/.auth_secret
+cache/debug_*.png
+.agent/
+.agents/
