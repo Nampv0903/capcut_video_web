@@ -1341,6 +1341,7 @@ if (btnStartRender) {
     renderTemplateList();
     updateSyncPairStatus();
 
+    let keepLockedForAsync = false;
     try {
       const payload = {
         template: activeTemplate,
@@ -1361,6 +1362,11 @@ if (btnStartRender) {
       }
       if (!data.success) throw new Error(data.error || 'Lỗi xuất video');
 
+      if (data.asyncStarted) {
+        keepLockedForAsync = true;
+        return;
+      }
+
       if (data.outputs && data.outputs.length > 0) {
         latestBatchOutputs = data.outputs;
         if (activeTemplate && String(activeTemplate.templateId) === renderTplId) {
@@ -1372,13 +1378,37 @@ if (btnStartRender) {
     } catch (err) {
       appendLog(`Lỗi khi ghép video: ${err.message}`, 'error');
     } finally {
-      lockedTemplateIds.delete(renderTplId);
-      activeRendersByTemplate.delete(renderTplId);
-      renderTemplateList();
-      updateSyncPairStatus();
+      if (!keepLockedForAsync) {
+        lockedTemplateIds.delete(renderTplId);
+        activeRendersByTemplate.delete(renderTplId);
+        renderTemplateList();
+        updateSyncPairStatus();
+      }
     }
   });
 }
+
+// Cloudflare-resilient background sync: while any template is rendering, poll status & outputs every 3.5s
+setInterval(async () => {
+  if (lockedTemplateIds.size === 0 && activeRendersByTemplate.size === 0) return;
+  try {
+    const [tplRes, outRes] = await Promise.all([
+      fetch('/api/templates/builtin'),
+      fetch('/api/outputs')
+    ]);
+    const tplData = await tplRes.json();
+    const outData = await outRes.json();
+    if (outData && outData.success) {
+      outputsHistory = outData.outputs || [];
+      renderOutputsForActiveTemplate();
+    }
+    if (tplData && tplData.success) {
+      syncActiveRendersFromServer(tplData.activeRenders, tplData.lockedTemplateIds);
+      renderTemplateList();
+      updateSyncPairStatus();
+    }
+  } catch {}
+}, 3500);
 
 // VIDEO TRIMMER MODAL LOGIC
 const videoTrimModal = document.getElementById('video-trim-modal');

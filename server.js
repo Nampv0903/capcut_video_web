@@ -1175,49 +1175,70 @@ app.post('/api/render', async (req, res) => {
       const canRunOnWebBot = isRealCapCutWebUrl || hasValidTemplateId;
 
       const tplIdStr = String(template.templateId || '');
-      logToClient(`🚀 Đang kích hoạt ${batchFileSets.length} LUỒNG SONG SONG ghép đúng thứ tự tải lên (1-1 -> ${batchFileSets.length}-${batchFileSets.length})...`, 'info');
-      const renderedOutputs = await runCapCutWebParallelBatch({
-        templateInfo: template,
-        batchFileSets,
-        maxConcurrency: 4,
-        onLog: (msg) => logToClient(msg, 'info'),
-        onProgress: (percent, status) => {
-          const lockEntry = activeRenderingTemplates.get(tplLockKey);
-          if (!lockEntry) return;
-          if (percent > (lockEntry.percent || 0)) lockEntry.percent = percent;
-          if (status) lockEntry.status = status;
-          broadcast('progress', { percent, status, templateId: tplIdStr, clientId });
-        },
-        onScreenshot: (image, label) => broadcast('bot_screenshot', { image, label, templateId: tplIdStr, clientId }),
-        onVideoReady: (outItem) => {
-          outItem.templateId = tplIdStr;
-          outItem.templateTitle = template.title || '';
-          outItem.clientId = clientId;
-          outItem.downloadUrl = `/api/download/${encodeURIComponent(outItem.filename)}`;
-          registerOutputForTemplate(outItem, template);
-          broadcast('single_video_ready', { output: outItem, templateId: tplIdStr, clientId });
-        }
+      logToClient(`🚀 Đang kích hoạt ${batchFileSets.length} luồng ghép video (tối ưu 2 luồng/lượt cho VPS, 1-1 -> ${batchFileSets.length}-${batchFileSets.length})...`, 'info');
+
+      // Respond immediately (<100ms) so Cloudflare's 100-second HTTP proxy timeout (Error 524) NEVER interrupts the client UI!
+      res.json({
+        success: true,
+        asyncStarted: true,
+        templateId: tplIdStr,
+        totalCount: expectedCount
       });
 
-      for (const out of renderedOutputs) {
-        out.templateId = tplIdStr;
-        out.templateTitle = template.title || '';
-        out.clientId = clientId;
-        out.downloadUrl = `/api/download/${encodeURIComponent(out.filename)}`;
-        registerOutputForTemplate(out, template);
-      }
+      (async () => {
+        try {
+          const renderedOutputs = await runCapCutWebParallelBatch({
+            templateInfo: template,
+            batchFileSets,
+            maxConcurrency: 2,
+            onLog: (msg) => logToClient(msg, 'info'),
+            onProgress: (percent, status) => {
+              const lockEntry = activeRenderingTemplates.get(tplLockKey);
+              if (!lockEntry) return;
+              if (percent > (lockEntry.percent || 0)) lockEntry.percent = percent;
+              if (status) lockEntry.status = status;
+              broadcast('progress', { percent, status, templateId: tplIdStr, clientId });
+            },
+            onScreenshot: (image, label) => broadcast('bot_screenshot', { image, label, templateId: tplIdStr, clientId }),
+            onVideoReady: (outItem) => {
+              outItem.templateId = tplIdStr;
+              outItem.templateTitle = template.title || '';
+              outItem.clientId = clientId;
+              outItem.downloadUrl = `/api/download/${encodeURIComponent(outItem.filename)}`;
+              registerOutputForTemplate(outItem, template);
+              broadcast('single_video_ready', { output: outItem, templateId: tplIdStr, clientId });
+            }
+          });
 
-      broadcast('render_complete', { outputs: renderedOutputs, templateId: tplIdStr, clientId });
-      return res.json({ success: true, outputs: renderedOutputs });
+          for (const out of renderedOutputs) {
+            out.templateId = tplIdStr;
+            out.templateTitle = template.title || '';
+            out.clientId = clientId;
+            out.downloadUrl = `/api/download/${encodeURIComponent(out.filename)}`;
+            registerOutputForTemplate(out, template);
+          }
+
+          broadcast('render_complete', { outputs: renderedOutputs, templateId: tplIdStr, clientId });
+        } catch (err) {
+          if (err && err.isCancelled) {
+            broadcast('render_cancelled', { templateId: tplIdStr, clientId });
+          } else {
+            logToClient(`Lỗi xuất song song: ${err.message}`, 'error');
+            broadcast('progress', { percent: 0, status: `Lỗi: ${err.message}`, templateId: tplIdStr, clientId });
+          }
+        } finally {
+          activeRenderingTemplates.delete(tplLockKey);
+          broadcast('template_locks', {
+            lockedTemplateIds: Array.from(activeRenderingTemplates.keys()),
+            activeRenders: Array.from(activeRenderingTemplates.values())
+          });
+          try {
+            fs.rmSync(jobSnapshotDir, { recursive: true, force: true });
+          } catch {}
+        }
+      })();
+      return;
     } catch (err) {
-      if (err && err.isCancelled) {
-        broadcast('render_cancelled', { templateId: String(template.templateId || ''), clientId });
-        return res.json({ success: false, cancelled: true, outputs: [] });
-      }
-      logToClient(`Lỗi xuất song song: ${err.message}`, 'error');
-      broadcast('progress', { percent: 0, status: `Lỗi: ${err.message}`, templateId: String(template.templateId || ''), clientId });
-      return res.status(500).json({ success: false, error: err.message });
-    } finally {
       activeRenderingTemplates.delete(tplLockKey);
       broadcast('template_locks', {
         lockedTemplateIds: Array.from(activeRenderingTemplates.keys()),
@@ -1226,6 +1247,8 @@ app.post('/api/render', async (req, res) => {
       try {
         fs.rmSync(jobSnapshotDir, { recursive: true, force: true });
       } catch {}
+      logToClient(`Lỗi khởi tạo luồng xuất: ${err.message}`, 'error');
+      return res.status(500).json({ success: false, error: err.message });
     }
   }
 

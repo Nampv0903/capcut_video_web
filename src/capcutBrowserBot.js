@@ -783,69 +783,62 @@ async function openExportConfirmDialog(page) {
     }
 
     if (uiState === 'HAS_EXPORT_BTN') {
-      // Find the exact on-screen coordinates of the REAL top-right Export button (rect.left > 100, rightmost on screen)
-      const expPt = await evalSafe(
-        page,
-        () => {
-          const candidates = [
-            ...Array.from(document.querySelectorAll('#export-video-btn')),
-            ...Array.from(document.querySelectorAll('button')).filter(
-              b => b.id !== 'export-confirm-button' && /^(Export|Xuất)$/i.test((b.innerText || '').trim())
-            )
-          ].filter(el => {
-            if (!el || el.disabled || el.classList.contains('lv-btn-disabled')) return false;
-            const r = el.getBoundingClientRect();
-            return r.width > 18 && r.height > 14 && r.left > 100 && r.top >= 0;
-          });
-          if (candidates.length === 0) return null;
-          candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
-          const r = candidates[0].getBoundingClientRect();
-          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
-        },
-        null,
-        2500,
-        null
-      );
-
-      if (expPt) {
-        await page.mouse.click(expPt.x, expPt.y).catch(() => {});
+      // IMPORTANT: #export-video-btn is a TOGGLE button! Clicking it twice within 500ms on a slow VPS CPU
+      // opens the popover on click #1 and immediately closes it on click #2!
+      // Therefore, perform ONLY ONE click per attempt, then poll 4.8s (12 * 400ms) for the popover to finish rendering.
+      if (attempt % 2 === 1) {
+        await evalSafe(
+          page,
+          () => {
+            const candidates = [
+              ...Array.from(document.querySelectorAll('#export-video-btn')),
+              ...Array.from(document.querySelectorAll('button')).filter(
+                b => b.id !== 'export-confirm-button' && /^(Export|Xuất)$/i.test((b.innerText || '').trim())
+              )
+            ].filter(el => {
+              if (!el || el.disabled || el.classList.contains('lv-btn-disabled')) return false;
+              const r = el.getBoundingClientRect();
+              return r.width > 18 && r.height > 14 && r.left > 100 && r.top >= 0;
+            });
+            if (candidates.length > 0) {
+              candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+              candidates[0].click();
+            }
+          },
+          null,
+          2500
+        );
+      } else {
+        const expPt = await evalSafe(
+          page,
+          () => {
+            const candidates = [
+              ...Array.from(document.querySelectorAll('#export-video-btn')),
+              ...Array.from(document.querySelectorAll('button')).filter(
+                b => b.id !== 'export-confirm-button' && /^(Export|Xuất)$/i.test((b.innerText || '').trim())
+              )
+            ].filter(el => {
+              if (!el || el.disabled || el.classList.contains('lv-btn-disabled')) return false;
+              const r = el.getBoundingClientRect();
+              return r.width > 18 && r.height > 14 && r.left > 100 && r.top >= 0;
+            });
+            if (candidates.length === 0) return null;
+            candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+            const r = candidates[0].getBoundingClientRect();
+            return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+          },
+          null,
+          2500,
+          null
+        );
+        if (expPt) {
+          await page.mouse.click(expPt.x, expPt.y).catch(() => {});
+        }
       }
 
-      // Wait 500ms; if neither #export-confirm-button nor choosePage-download-btn opened yet, trigger native DOM .click() on the rightmost button
-      await page.waitForTimeout(500);
-      await evalSafe(
-        page,
-        () => {
-          const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-            c => c && c.getBoundingClientRect().width > 18 && c.getBoundingClientRect().left >= 0
-          );
-          const dlBtns = Array.from(
-            document.querySelectorAll('[class*="choosePage-download-btn"] button, [class*="choosePage-download-btn"]')
-          ).filter(d => d && d.getBoundingClientRect().width > 18 && d.getBoundingClientRect().left >= 0);
-          if (cBtns.length > 0 || dlBtns.length > 0) return; // Menu already opened by mouse.click!
-
-          const candidates = [
-            ...Array.from(document.querySelectorAll('#export-video-btn')),
-            ...Array.from(document.querySelectorAll('button')).filter(
-              b => b.id !== 'export-confirm-button' && /^(Export|Xuất)$/i.test((b.innerText || '').trim())
-            )
-          ].filter(el => {
-            if (!el || el.disabled || el.classList.contains('lv-btn-disabled')) return false;
-            const r = el.getBoundingClientRect();
-            return r.width > 18 && r.height > 14 && r.left > 100 && r.top >= 0;
-          });
-          if (candidates.length > 0) {
-            candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
-            candidates[0].click();
-          }
-        },
-        null,
-        2500
-      );
-
-      // Poll up to 3.5s for the popover menu (#export-confirm-button or choosePage-download-btn) so we NEVER toggle it closed!
-      for (let w = 0; w < 10; w++) {
-        await page.waitForTimeout(350);
+      // Poll up to 4.8s for the popover menu (#export-confirm-button or choosePage-download-btn) so we NEVER toggle it closed on slow VPS CPUs!
+      for (let w = 0; w < 12; w++) {
+        await page.waitForTimeout(400);
         const subState = await evalSafe(
           page,
           () => {
@@ -996,8 +989,8 @@ async function triggerExportAndSaveDownload({
       await page.mouse.click(confirmPt.x, confirmPt.y).catch(() => {});
     }
 
-    // Wait 650ms; ONLY trigger DOM .click() if #export-confirm-button is still visible and enabled (prevents double-click)
-    await page.waitForTimeout(650);
+    // Wait 1500ms; ONLY trigger DOM .click() if #export-confirm-button is still visible and enabled
+    await page.waitForTimeout(1500);
     await evalSafe(page, () => {
       const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(btn => {
         if (!btn || btn.disabled || btn.classList.contains('lv-btn-disabled') || btn.getAttribute('aria-disabled') === 'true') {
@@ -1312,7 +1305,7 @@ async function runCapCutWebAutomation({
   }
 }
 
-const GLOBAL_MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '4', 10) || 4;
+const GLOBAL_MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '2', 10) || 2;
 let sharedBrowserContext = null;
 let sharedContextLaunchPromise = null;
 let activeBatchCount = 0;
@@ -1544,7 +1537,7 @@ async function releaseSharedBrowserContext(allVerified, onLog) {
 async function runCapCutWebParallelBatch({
   templateInfo,
   batchFileSets = [],
-  maxConcurrency = 4,
+  maxConcurrency = 2,
   onLog = () => {},
   onProgress = () => {},
   onScreenshot = () => {},
