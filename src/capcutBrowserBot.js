@@ -140,10 +140,10 @@ async function killProfileChromeProcesses() {
     );
   });
   await new Promise(r => setTimeout(r, 400));
-  ensureChromeProfileAllowsMultiDownloads();
+  ensureChromeProfileAllowsMultiDownloads(true);
 }
 
-function ensureChromeProfileAllowsMultiDownloads() {
+function ensureChromeProfileAllowsMultiDownloads(offscreen = true) {
   try {
     const defaultDir = path.join(PROFILE_DIR, 'Default');
     if (!fs.existsSync(defaultDir)) fs.mkdirSync(defaultDir, { recursive: true });
@@ -181,8 +181,56 @@ function ensureChromeProfileAllowsMultiDownloads() {
     if (!prefs.download || typeof prefs.download !== 'object') prefs.download = {};
     prefs.download.prompt_for_download = false;
 
+    if (!prefs.browser || typeof prefs.browser !== 'object') prefs.browser = {};
+    if (offscreen) {
+      prefs.browser.window_placement = {
+        bottom: -1500,
+        left: -2400,
+        maximized: false,
+        right: -960,
+        top: -2400,
+        work_area_bottom: 1080,
+        work_area_left: 0,
+        work_area_right: 1920,
+        work_area_top: 0
+      };
+    } else {
+      prefs.browser.window_placement = {
+        bottom: 960,
+        left: 60,
+        maximized: true,
+        right: 1500,
+        top: 60,
+        work_area_bottom: 1080,
+        work_area_left: 0,
+        work_area_right: 1920,
+        work_area_top: 0
+      };
+    }
+
     fs.writeFileSync(prefPath, JSON.stringify(prefs), 'utf8');
   } catch {}
+}
+
+async function hidePageWindowOffscreen(page) {
+  if (!page) return;
+  let cdp = null;
+  try {
+    cdp = await page.context().newCDPSession(page);
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { windowState: 'normal' }
+    }).catch(() => {});
+    await cdp.send('Browser.setWindowBounds', {
+      windowId,
+      bounds: { left: -2400, top: -2400, width: 1440, height: 900, windowState: 'normal' }
+    }).catch(() => {});
+  } catch {} finally {
+    if (cdp) {
+      try { await cdp.detach(); } catch {}
+    }
+  }
 }
 
 async function evalSafe(page, pageFunction, arg, timeoutMs = 7000, fallbackValue = null) {
@@ -242,6 +290,7 @@ async function openCapCutLoginWindow(onLog = () => {}, onProgress = () => {}) {
 
   if (!(await isCdpAlive())) {
     await killProfileChromeProcesses();
+    ensureChromeProfileAllowsMultiDownloads(false);
     const chromeExe = findChromeExecutable();
     const tr = `'${chromeExe}' --user-data-dir=${PROFILE_DIR} --remote-debugging-port=${CDP_PORT} --start-maximized --new-window ${loginUrl}`;
     await execPromise(`schtasks /Create /TN "CapCutStudioBrowser" /TR "${tr}" /SC ONCE /ST 00:00 /F`);
@@ -566,51 +615,72 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
  * using Playwright trusted clicks (with safe timeout) so Chromium records a valid user gesture for automatic downloads.
  */
 async function openExportConfirmDialog(page) {
-  await evalSafe(
-    page,
-    () => {
-      const btns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null);
-      for (const b of btns) {
-        const t = (b.innerText || '').trim();
-        if (/^(OK|Got it|Đã hiểu)$/i.test(t)) b.click();
-      }
-    },
-    null,
-    3000
-  );
-
   for (let attempt = 1; attempt <= 45; attempt++) {
+    // Dismiss any onboarding tooltips, guide buttons, or blocking modal close icons on every attempt
+    await evalSafe(
+      page,
+      () => {
+        const btns = Array.from(document.querySelectorAll('button')).filter(b => {
+          const r = b.getBoundingClientRect();
+          return r.width > 0 && r.height > 0 && r.left >= 0;
+        });
+        for (const b of btns) {
+          const t = (b.innerText || '').trim();
+          if (/^(OK|Got it|Đã hiểu)$/i.test(t)) b.click();
+        }
+        const closeIcons = Array.from(document.querySelectorAll('.lv-modal-close-icon'));
+        for (const x of closeIcons) {
+          const r = x.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) x.click();
+        }
+      },
+      null,
+      3000
+    );
+
     const uiState = await evalSafe(
       page,
       () => {
+        const isOnScreen = (el) => {
+          if (!el) return false;
+          const style = window.getComputedStyle(el);
+          if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity || '1') < 0.05) {
+            return false;
+          }
+          const r = el.getBoundingClientRect();
+          return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+        };
         const isUsable = (el) =>
           Boolean(
-            el &&
-              el.offsetParent !== null &&
+            isOnScreen(el) &&
               !el.disabled &&
               !el.classList.contains('lv-btn-disabled') &&
               el.getAttribute('aria-disabled') !== 'true'
           );
 
-        const visibleConfirmBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-          el => el && el.offsetParent !== null
-        );
+        const visibleConfirmBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(isOnScreen);
         if (visibleConfirmBtns.length > 0) {
           return visibleConfirmBtns.some(isUsable) ? 'READY_CONFIRM' : 'CONFIRM_LOADING';
         }
 
-        const dlBtns = Array.from(document.querySelectorAll('[class*="choosePage-download-btn"] button')).filter(isUsable);
+        const dlBtns = Array.from(
+          document.querySelectorAll('[class*="choosePage-download-btn"] button, [class*="choosePage-download-btn"]')
+        ).filter(isUsable);
         if (dlBtns.length > 0) {
           return 'HAS_DL_MENU';
         }
 
-        const expBtns = Array.from(document.querySelectorAll('#export-video-btn')).filter(isUsable);
+        // IMPORTANT: CapCut renders TWO #export-video-btn elements: one real button at top-right (left > 100)
+        // and one hidden duplicate at negative X (left ≈ -67). Always filter for r.left > 100!
+        const expBtns = Array.from(document.querySelectorAll('#export-video-btn')).filter(
+          el => isUsable(el) && el.getBoundingClientRect().left > 100
+        );
         if (expBtns.length > 0) {
           return 'HAS_EXPORT_BTN';
         }
 
         const fallbackExpBtns = Array.from(document.querySelectorAll('button')).filter(b => {
-          if (!isUsable(b) || b.id === 'export-confirm-button') return false;
+          if (!isUsable(b) || b.id === 'export-confirm-button' || b.getBoundingClientRect().left <= 100) return false;
           const t = (b.innerText || '').trim();
           return /^(Export|Xuất)$/i.test(t);
         });
@@ -626,7 +696,7 @@ async function openExportConfirmDialog(page) {
     );
 
     if (uiState === 'READY_CONFIRM') {
-      await page.waitForTimeout(350);
+      await page.waitForTimeout(550);
       return true;
     }
 
@@ -636,28 +706,61 @@ async function openExportConfirmDialog(page) {
       continue;
     }
 
+    const clickChooseDownloadMenu = async () => {
+      const targetPt = await evalSafe(
+        page,
+        () => {
+          const btns = Array.from(
+            document.querySelectorAll('[class*="choosePage-download-btn"] button, [class*="choosePage-download-btn"]')
+          ).filter(b => {
+            const r = b.getBoundingClientRect();
+            return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0 && !b.disabled;
+          });
+          if (btns.length === 0) return null;
+          const r = btns[0].getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        },
+        null,
+        2500,
+        null
+      );
+      if (targetPt) {
+        await page.mouse.click(targetPt.x, targetPt.y).catch(() => {});
+      }
+      await page.waitForTimeout(450);
+      await evalSafe(
+        page,
+        () => {
+          const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
+            c => c && c.getBoundingClientRect().width > 18 && c.getBoundingClientRect().left >= 0
+          );
+          if (cBtns.length > 0) return; // Already opened #export-confirm-button!
+          const btns = Array.from(
+            document.querySelectorAll('[class*="choosePage-download-btn"] button, [class*="choosePage-download-btn"]')
+          ).filter(b => {
+            const r = b.getBoundingClientRect();
+            return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0 && !b.disabled;
+          });
+          if (btns.length > 0) btns[0].click();
+        },
+        null,
+        2500
+      );
+    };
+
     if (uiState === 'HAS_DL_MENU') {
-      await page
-        .locator('[class*="choosePage-download-btn"] button:visible')
-        .last()
-        .click({ timeout: 2000 })
-        .catch(() =>
-          evalSafe(page, () => {
-            const btns = Array.from(document.querySelectorAll('[class*="choosePage-download-btn"] button')).filter(
-              b => b.offsetParent !== null && !b.disabled
-            );
-            if (btns.length > 0) btns[btns.length - 1].click();
-          })
-        );
+      await clickChooseDownloadMenu();
 
       for (let w = 0; w < 10; w++) {
         await page.waitForTimeout(350);
         const confirmState = await evalSafe(
           page,
           () => {
-            const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-              c => c && c.offsetParent !== null
-            );
+            const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(c => {
+              if (!c) return false;
+              const r = c.getBoundingClientRect();
+              return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+            });
             if (cBtns.length === 0) return 'NONE';
             const ready = cBtns.some(
               c => !c.disabled && !c.classList.contains('lv-btn-disabled') && c.getAttribute('aria-disabled') !== 'true'
@@ -669,7 +772,7 @@ async function openExportConfirmDialog(page) {
           'NONE'
         );
         if (confirmState === 'READY') {
-          await page.waitForTimeout(350);
+          await page.waitForTimeout(550);
           return true;
         }
         if (confirmState === 'LOADING') {
@@ -680,26 +783,65 @@ async function openExportConfirmDialog(page) {
     }
 
     if (uiState === 'HAS_EXPORT_BTN') {
-      await page
-        .locator('#export-video-btn:visible')
-        .last()
-        .click({ timeout: 2000 })
-        .catch(() =>
-          evalSafe(page, () => {
-            const expBtns = Array.from(document.querySelectorAll('#export-video-btn')).filter(
-              b => b.offsetParent !== null && !b.disabled
-            );
-            if (expBtns.length > 0) {
-              expBtns[expBtns.length - 1].click();
-              return;
-            }
-            const fallback = Array.from(document.querySelectorAll('button')).filter(b => {
-              if (b.offsetParent === null || b.disabled || b.id === 'export-confirm-button') return false;
-              return /^(Export|Xuất)$/i.test((b.innerText || '').trim());
-            });
-            if (fallback.length > 0) fallback[fallback.length - 1].click();
-          })
-        );
+      // Find the exact on-screen coordinates of the REAL top-right Export button (rect.left > 100, rightmost on screen)
+      const expPt = await evalSafe(
+        page,
+        () => {
+          const candidates = [
+            ...Array.from(document.querySelectorAll('#export-video-btn')),
+            ...Array.from(document.querySelectorAll('button')).filter(
+              b => b.id !== 'export-confirm-button' && /^(Export|Xuất)$/i.test((b.innerText || '').trim())
+            )
+          ].filter(el => {
+            if (!el || el.disabled || el.classList.contains('lv-btn-disabled')) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 18 && r.height > 14 && r.left > 100 && r.top >= 0;
+          });
+          if (candidates.length === 0) return null;
+          candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+          const r = candidates[0].getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        },
+        null,
+        2500,
+        null
+      );
+
+      if (expPt) {
+        await page.mouse.click(expPt.x, expPt.y).catch(() => {});
+      }
+
+      // Wait 500ms; if neither #export-confirm-button nor choosePage-download-btn opened yet, trigger native DOM .click() on the rightmost button
+      await page.waitForTimeout(500);
+      await evalSafe(
+        page,
+        () => {
+          const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
+            c => c && c.getBoundingClientRect().width > 18 && c.getBoundingClientRect().left >= 0
+          );
+          const dlBtns = Array.from(
+            document.querySelectorAll('[class*="choosePage-download-btn"] button, [class*="choosePage-download-btn"]')
+          ).filter(d => d && d.getBoundingClientRect().width > 18 && d.getBoundingClientRect().left >= 0);
+          if (cBtns.length > 0 || dlBtns.length > 0) return; // Menu already opened by mouse.click!
+
+          const candidates = [
+            ...Array.from(document.querySelectorAll('#export-video-btn')),
+            ...Array.from(document.querySelectorAll('button')).filter(
+              b => b.id !== 'export-confirm-button' && /^(Export|Xuất)$/i.test((b.innerText || '').trim())
+            )
+          ].filter(el => {
+            if (!el || el.disabled || el.classList.contains('lv-btn-disabled')) return false;
+            const r = el.getBoundingClientRect();
+            return r.width > 18 && r.height > 14 && r.left > 100 && r.top >= 0;
+          });
+          if (candidates.length > 0) {
+            candidates.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+            candidates[0].click();
+          }
+        },
+        null,
+        2500
+      );
 
       // Poll up to 3.5s for the popover menu (#export-confirm-button or choosePage-download-btn) so we NEVER toggle it closed!
       for (let w = 0; w < 10; w++) {
@@ -707,18 +849,24 @@ async function openExportConfirmDialog(page) {
         const subState = await evalSafe(
           page,
           () => {
-            const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-              c => c && c.offsetParent !== null
-            );
+            const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(c => {
+              if (!c) return false;
+              const r = c.getBoundingClientRect();
+              return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+            });
             if (cBtns.length > 0) {
               const ready = cBtns.some(
                 c => !c.disabled && !c.classList.contains('lv-btn-disabled') && c.getAttribute('aria-disabled') !== 'true'
               );
               return ready ? 'READY_CONFIRM' : 'CONFIRM_LOADING';
             }
-            const dlBtns = Array.from(document.querySelectorAll('[class*="choosePage-download-btn"] button')).filter(
-              dl => dl.offsetParent !== null && !dl.disabled
-            );
+            const dlBtns = Array.from(
+              document.querySelectorAll('[class*="choosePage-download-btn"] button, [class*="choosePage-download-btn"]')
+            ).filter(dl => {
+              if (!dl || dl.disabled) return false;
+              const r = dl.getBoundingClientRect();
+              return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+            });
             if (dlBtns.length > 0) return 'HAS_DL_MENU';
             return 'NONE';
           },
@@ -728,33 +876,24 @@ async function openExportConfirmDialog(page) {
         );
 
         if (subState === 'READY_CONFIRM') {
-          await page.waitForTimeout(350);
+          await page.waitForTimeout(550);
           return true;
         }
         if (subState === 'CONFIRM_LOADING') {
           break;
         }
         if (subState === 'HAS_DL_MENU') {
-          await page
-            .locator('[class*="choosePage-download-btn"] button:visible')
-            .last()
-            .click({ timeout: 2000 })
-            .catch(() =>
-              evalSafe(page, () => {
-                const btns = Array.from(document.querySelectorAll('[class*="choosePage-download-btn"] button')).filter(
-                  b => b.offsetParent !== null && !b.disabled
-                );
-                if (btns.length > 0) btns[btns.length - 1].click();
-              })
-            );
+          await clickChooseDownloadMenu();
           for (let k = 0; k < 10; k++) {
             await page.waitForTimeout(350);
             const confirmState = await evalSafe(
               page,
               () => {
-                const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-                  c => c && c.offsetParent !== null
-                );
+                const cBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(c => {
+                  if (!c) return false;
+                  const r = c.getBoundingClientRect();
+                  return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+                });
                 if (cBtns.length === 0) return 'NONE';
                 const ready = cBtns.some(
                   c => !c.disabled && !c.classList.contains('lv-btn-disabled') && c.getAttribute('aria-disabled') !== 'true'
@@ -766,7 +905,7 @@ async function openExportConfirmDialog(page) {
               'NONE'
             );
             if (confirmState === 'READY') {
-              await page.waitForTimeout(350);
+              await page.waitForTimeout(550);
               return true;
             }
             if (confirmState === 'LOADING') {
@@ -809,16 +948,68 @@ async function triggerExportAndSaveDownload({
 
   const clickConfirmBtn = async () => {
     await acquireExportSubmitGate();
-    await page
-      .locator('#export-confirm-button:visible')
-      .last()
-      .click({ timeout: 2500 })
-      .catch(() => {});
-    await evalSafe(page, () => {
-      const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-        btn => btn.offsetParent !== null && !btn.disabled && !btn.classList.contains('lv-btn-disabled')
+    // Locate the on-screen #export-confirm-button
+    let confirmPt = await evalSafe(
+      page,
+      () => {
+        const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(btn => {
+          if (!btn || btn.disabled || btn.classList.contains('lv-btn-disabled') || btn.getAttribute('aria-disabled') === 'true') {
+            return false;
+          }
+          const r = btn.getBoundingClientRect();
+          return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+        });
+        if (btns.length === 0) return null;
+        btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+        const r = btns[0].getBoundingClientRect();
+        return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+      },
+      null,
+      2500,
+      null
+    );
+
+    if (!confirmPt) {
+      await openExportConfirmDialog(page);
+      confirmPt = await evalSafe(
+        page,
+        () => {
+          const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(btn => {
+            if (!btn || btn.disabled || btn.classList.contains('lv-btn-disabled') || btn.getAttribute('aria-disabled') === 'true') {
+              return false;
+            }
+            const r = btn.getBoundingClientRect();
+            return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+          });
+          if (btns.length === 0) return null;
+          btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+          const r = btns[0].getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+        },
+        null,
+        2500,
+        null
       );
-      if (btns.length > 0) btns[btns.length - 1].click();
+    }
+
+    if (confirmPt) {
+      await page.mouse.click(confirmPt.x, confirmPt.y).catch(() => {});
+    }
+
+    // Wait 650ms; ONLY trigger DOM .click() if #export-confirm-button is still visible and enabled (prevents double-click)
+    await page.waitForTimeout(650);
+    await evalSafe(page, () => {
+      const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(btn => {
+        if (!btn || btn.disabled || btn.classList.contains('lv-btn-disabled') || btn.getAttribute('aria-disabled') === 'true') {
+          return false;
+        }
+        const r = btn.getBoundingClientRect();
+        return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+      });
+      if (btns.length > 0) {
+        btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+        btns[0].click();
+      }
     });
   };
 
@@ -1010,6 +1201,8 @@ async function runCapCutWebAutomation({
     viewport: { width: 1440, height: 900 },
     acceptDownloads: true,
     args: [
+      '--window-position=-2400,-2400',
+      '--window-size=1440,900',
       '--disable-blink-features=AutomationControlled',
       '--enable-webgl',
       '--ignore-gpu-blocklist',
@@ -1030,6 +1223,7 @@ async function runCapCutWebAutomation({
 
   try {
     const editorPage = context.pages()[0] || await context.newPage();
+    await hidePageWindowOffscreen(editorPage);
     await enablePageMultiDownloads(editorPage);
 
     await editorPage.goto(targetEditorUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -1253,9 +1447,11 @@ async function getHealthySharedContext() {
       const ctx = await chromium.launchPersistentContext(PROFILE_DIR, {
         channel: 'chrome',
         headless: false,
-        viewport: { width: 1280, height: 720 },
+        viewport: { width: 1440, height: 900 },
         acceptDownloads: true,
         args: [
+          '--window-position=-2400,-2400',
+          '--window-size=1440,900',
           '--disable-blink-features=AutomationControlled',
           '--enable-webgl',
           '--ignore-gpu-blocklist',
@@ -1266,6 +1462,10 @@ async function getHealthySharedContext() {
           '--disable-ipc-flooding-protection'
         ]
       });
+      const initPage = ctx.pages()[0];
+      if (initPage) {
+        await hidePageWindowOffscreen(initPage);
+      }
 
       // Prevent CapCut's BroadcastChannel("capcut-business-tabs-v1"), storage events, and page visibility from detecting multiple open editor tabs
       await ctx.addInitScript(() => {
@@ -1442,6 +1642,7 @@ async function runCapCutWebParallelBatch({
           controller.pages.add(page);
 
           const executeAttempt = async () => {
+            await hidePageWindowOffscreen(page);
             await enablePageMultiDownloads(page);
 
             jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 10);
