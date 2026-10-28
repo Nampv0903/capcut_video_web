@@ -144,7 +144,8 @@ function updateActiveTemplateProgressUI() {
     return;
   }
 
-  const pct = st ? Math.max(0, Math.min(100, Math.round(st.percent || 12))) : 12;
+  const rawPct = st && typeof st.percent === 'number' ? st.percent : 12;
+  const pct = Math.max(0, Math.min(100, Math.round(rawPct)));
   const status = (st && st.status) || 'Đang tạo video...';
   progressWrapperEl.style.display = 'block';
   if (progressBarFill) progressBarFill.style.width = `${pct}%`;
@@ -156,7 +157,7 @@ function setProgress(percent, status, forceReset = false, targetTemplateId = nul
   const tplId = String(targetTemplateId || (activeTemplate && activeTemplate.templateId) || '');
   let pct = Math.max(0, Math.min(100, Math.round(percent || 0)));
 
-  if (tplId) {
+  if (tplId && (lockedTemplateIds.has(tplId) || activeRendersByTemplate.has(tplId))) {
     const prev = activeRendersByTemplate.get(tplId) || {
       templateId: tplId,
       clientId: CLIENT_ID,
@@ -1051,7 +1052,7 @@ if (btnAnalyzeUrl) {
     }
 
     btnAnalyzeUrl.disabled = true;
-    setProgress(25, 'Đang phân tích cấu trúc phân đoạn của mẫu CapCut...');
+    appendLog('Đang phân tích cấu trúc phân đoạn của mẫu CapCut...', 'info');
 
     try {
       const res = await fetch('/api/templates/analyze-url', {
@@ -1071,7 +1072,7 @@ if (btnAnalyzeUrl) {
 
       if (inputTemplateUrl) inputTemplateUrl.value = '';
       selectTemplate(data.template);
-      setProgress(100, `Đã nạp mẫu "${data.template.title}" (${data.template.slotCount} phân đoạn)`);
+      appendLog(`Đã nạp mẫu "${data.template.title}" (${data.template.slotCount} phân đoạn).`, 'success');
     } catch (err) {
       appendLog(`Lỗi phân tích mẫu: ${err.message}`, 'error');
     } finally {
@@ -1132,18 +1133,20 @@ if (btnClearClips) {
       if (clipsData.success) userClips = clipsData.clips || [];
     }
     renderSlotsTimeline();
-    setProgress(0, 'Đã làm mới danh sách file ở các phân đoạn của mẫu hiện tại.');
   });
 }
 
 // Clear outputs list of the active template
 if (btnClearOutputs) {
   btnClearOutputs.addEventListener('click', async () => {
-    const tplId = activeTemplate ? activeTemplate.templateId : '';
+    const tplId = activeTemplate ? String(activeTemplate.templateId || '') : '';
     const qs = tplId ? `?templateId=${encodeURIComponent(tplId)}` : '';
     await fetch(`/api/outputs/ALL${qs}`, { method: 'DELETE' });
+    if (tplId && !lockedTemplateIds.has(tplId)) {
+      activeRendersByTemplate.delete(tplId);
+    }
     await loadOutputsHistory();
-    setProgress(0, 'Đã xóa danh sách video đã tạo của mẫu hiện tại.');
+    updateSyncPairStatus();
   });
 }
 
@@ -1552,7 +1555,7 @@ if (btnTrimSave) {
         }
         renderSlotsTimeline();
         await saveActiveTemplateSlots();
-        setProgress(100, `Đã cắt Video #${pad2(qIdx + 1)} ở Đoạn ${pad2(slotIdx + 1)} (${data.clip.duration}s)`);
+        appendLog(`Đã cắt Video #${pad2(qIdx + 1)} ở Đoạn ${pad2(slotIdx + 1)} (${data.clip.duration}s)`, 'success');
       }
       closeVideoTrimmerModal();
     } catch (err) {
