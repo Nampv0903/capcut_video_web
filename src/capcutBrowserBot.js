@@ -289,6 +289,10 @@ async function openCapCutLoginWindow(onLog = () => {}, onProgress = () => {}) {
   onProgress(20, 'Đang mở cửa sổ đăng nhập tài khoản CapCut...');
 
   if (!(await isCdpAlive())) {
+    if (sharedBrowserContext) {
+      try { await sharedBrowserContext.close(); } catch {}
+      sharedBrowserContext = null;
+    }
     await killProfileChromeProcesses();
     ensureChromeProfileAllowsMultiDownloads(false);
     const chromeExe = findChromeExecutable();
@@ -471,9 +475,115 @@ async function closeCapCutLoginWindow() {
 }
 
 /**
- * Fill template slots inside CapCut Web Editor using .segment-item[data-mutable-index] inputs
+ * Returns an already-open CapCut tab from the Export Complete / Download modal (.lv_share_export-container or .template-post-publisher)
+ * directly back to the Template Editor timeline (.segment-item[data-mutable-index]) without reloading the page or opening a new tab.
  */
-async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () => {}) {
+async function returnToEditorOnSameTab(page) {
+  if (!page || page.isClosed()) return false;
+
+  for (let step = 0; step < 6; step++) {
+    const state = await evalSafe(
+      page,
+      () => {
+        // 1. If .lv_share_export-container is open, trigger its XState CLOSE transition + callbacks via React Fiber
+        const expHeader = document.querySelector('.lv_share_export-container-header, .lv_share_export-container');
+        if (expHeader) {
+          const fk = Object.keys(expHeader).find(k => k.startsWith('__reactFiber'));
+          let f = fk ? expHeader[fk] : null;
+          while (f && !(f.memoizedProps && (f.memoizedProps.renderService || f.memoizedProps.handleCloseCallback))) {
+            f = f.return;
+          }
+          if (f && f.memoizedProps) {
+            const mp = f.memoizedProps;
+            try {
+              if (mp.renderService && typeof mp.renderService.send === 'function') {
+                mp.renderService.send('CLOSE');
+              }
+            } catch {}
+            try {
+              if (typeof mp.handleCloseCallback === 'function') mp.handleCloseCallback();
+            } catch {}
+            try {
+              if (typeof mp.shareModalHideCallback === 'function') mp.shareModalHideCallback();
+            } catch {}
+          }
+        }
+
+        // 2. Also click .template-post-publisher-back or modal close icons if present
+        const backEl = document.querySelector(
+          '.template-post-publisher-back, [class*="publisher-back"], .lv-modal-close-icon'
+        );
+        if (backEl) {
+          try { backEl.click(); } catch {}
+        }
+
+        const expContainer = document.querySelector('.lv_share_export-container');
+        const expRect = expContainer ? expContainer.getBoundingClientRect() : null;
+        const hasExportModal = Boolean(expRect && expRect.width > 100 && expRect.height > 100);
+
+        const pubContainer = document.querySelector('.template-post-publisher');
+        const pubRect = pubContainer ? pubContainer.getBoundingClientRect() : null;
+        const hasPubModal = Boolean(pubRect && pubRect.width > 100 && pubRect.height > 100);
+
+        const seg0 = document.querySelector('.segment-item[data-mutable-index="0"]');
+        const segRect = seg0 ? seg0.getBoundingClientRect() : null;
+        const hasTimeline = Boolean(segRect && segRect.width > 20 && segRect.height > 20);
+
+        const headerRightSvg = document.querySelector('.lv_share_export-container-header-right svg:last-child');
+        const svgRect = headerRightSvg ? headerRightSvg.getBoundingClientRect() : null;
+
+        return {
+          hasExportModal,
+          hasPubModal,
+          hasTimeline,
+          closeSvgPt: svgRect && svgRect.width > 0 ? { x: svgRect.left + svgRect.width / 2, y: svgRect.top + svgRect.height / 2 } : null
+        };
+      },
+      null,
+      3000,
+      null
+    );
+
+    if (state && state.hasTimeline && !state.hasExportModal && !state.hasPubModal) {
+      await page.keyboard.press('Escape').catch(() => {});
+      return true;
+    }
+
+    if (state && state.closeSvgPt) {
+      await page.mouse.click(state.closeSvgPt.x, state.closeSvgPt.y).catch(() => {});
+    }
+    await page.keyboard.press('Escape').catch(() => {});
+    await page.waitForTimeout(400);
+  }
+
+  // Final check: is the timeline visible and usable?
+  const finalOk = await evalSafe(
+    page,
+    () => {
+      const seg0 = document.querySelector('.segment-item[data-mutable-index="0"]');
+      const segRect = seg0 ? seg0.getBoundingClientRect() : null;
+      const expContainer = document.querySelector('.lv_share_export-container');
+      const expRect = expContainer ? expContainer.getBoundingClientRect() : null;
+      return Boolean(
+        segRect &&
+        segRect.width > 20 &&
+        segRect.height > 20 &&
+        (!expRect || expRect.width < 100)
+      );
+    },
+    null,
+    2500,
+    false
+  );
+  return Boolean(finalOk);
+}
+
+/**
+ * Fill template slots inside CapCut Web Editor using .segment-item[data-mutable-index] inputs
+ * Supports BOTH fresh tabs (direct input[type="file"]) AND reused tabs (clicking .tier-inner button -> .menu-mutable input[type="file"])!
+ */
+async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () => {}, prevUploadedFiles = null) {
+  await returnToEditorOnSameTab(editorPage).catch(() => {});
   await editorPage.waitForSelector('.segment-item[data-mutable-index], .segment-item input[type="file"]', { timeout: 30000 }).catch(() => {});
   let segmentItems = editorPage.locator('.segment-item[data-mutable-index]');
   let slotCount = await segmentItems.count();
@@ -494,13 +604,15 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
 
   onLog(`Đang tự động nhét ${videoFilePaths.length} file của đại ca vào ${slotCount} phân đoạn của mẫu (chạy ngầm 100%)...`);
 
-  // Record the original template thumbnail URL (img.src) of EVERY slot before we touch anything
+  // Record the current active thumbnail URL (img.tier-sprite-img / first img) of EVERY slot before we touch anything
   const originalSlotImgs = await evalSafe(
     editorPage,
     (count) => {
       const urls = [];
       for (let i = 0; i < count; i++) {
-        const img = document.querySelector(`.segment-item[data-mutable-index="${i}"] img`);
+        const img =
+          document.querySelector(`.segment-item[data-mutable-index="${i}"] img.tier-sprite-img`) ||
+          document.querySelector(`.segment-item[data-mutable-index="${i}"] img`);
         urls.push(img ? img.src : '');
       }
       return urls;
@@ -516,54 +628,94 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
       return false;
     }
     const segSelector = `.segment-item[data-mutable-index="${i}"]`;
+    const segLocator = editorPage.locator(segSelector).first();
     const segInput = editorPage.locator(`${segSelector} input[type="file"]`).first();
-    if (await segInput.count().catch(() => 0) === 0) return true;
-
     const origImgSrc = originalSlotImgs[i] || '';
 
-    for (let retry = 1; retry <= 4; retry++) {
-      if (await segInput.count().catch(() => 0) === 0) {
-        return true;
-      }
+    // If this reused tab already uploaded this exact same file into slot i on the previous run, no need to re-upload
+    const hasDirectInputInit = (await segInput.count().catch(() => 0)) > 0;
+    if (
+      !hasDirectInputInit &&
+      Array.isArray(prevUploadedFiles) &&
+      prevUploadedFiles[i] === fileToUse &&
+      origImgSrc.startsWith('blob:')
+    ) {
+      return true;
+    }
 
+    for (let retry = 1; retry <= 4; retry++) {
       if (retry > 1) {
         onLog(`🔄 Ô #${i + 1}/${slotCount} đang đồng bộ, tự động nạp lại lần ${retry}: ${path.basename(fileToUse)}...`);
-        await editorPage.waitForTimeout(700);
-        if (await segInput.count().catch(() => 0) === 0) return true;
+        await editorPage.keyboard.press('Escape').catch(() => {});
+        await editorPage.waitForTimeout(600);
       }
 
-      await acquireSlotUploadGate();
-      const setOk = await segInput.setInputFiles(fileToUse, { timeout: 7000 }).then(() => true).catch(() => false);
+      let setOk = false;
+      const directInputCount = await segInput.count().catch(() => 0);
+
+      if (directInputCount > 0) {
+        // Fresh slot: upload directly via .segment-item[data-mutable-index="i"] input[type="file"]
+        await acquireSlotUploadGate();
+        setOk = await segInput.setInputFiles(fileToUse, { timeout: 7000 }).then(() => true).catch(() => false);
+      } else {
+        // Reused tab slot (already filled once): click .tier-inner button on the slot to open .menu-mutable ("Replace") and upload via its input[type="file"]
+        await editorPage.keyboard.press('Escape').catch(() => {});
+        await editorPage.waitForTimeout(150);
+
+        const editBtn = segLocator.locator('.tier-inner button').first();
+        if ((await editBtn.count().catch(() => 0)) > 0) {
+          await editBtn.click({ timeout: 3000 }).catch(async () => {
+            await segLocator.click({ timeout: 3000 }).catch(() => {});
+          });
+        } else {
+          await segLocator.click({ timeout: 3000 }).catch(() => {});
+        }
+        await editorPage.waitForTimeout(420);
+
+        const menuInput = editorPage.locator('.menu-mutable:visible input[type="file"]').last();
+        if ((await menuInput.count().catch(() => 0)) > 0) {
+          await acquireSlotUploadGate();
+          setOk = await menuInput.setInputFiles(fileToUse, { timeout: 7000 }).then(() => true).catch(() => false);
+        } else {
+          const fallbackMenuInput = editorPage.locator('.menu-mutable input[type="file"], [class*="segment-widget-menu"] input[type="file"]').last();
+          if ((await fallbackMenuInput.count().catch(() => 0)) > 0) {
+            await acquireSlotUploadGate();
+            setOk = await fallbackMenuInput.setInputFiles(fileToUse, { timeout: 7000 }).then(() => true).catch(() => false);
+          }
+        }
+      }
+
       if (!setOk) {
-        if (await segInput.count().catch(() => 0) === 0) return true;
         continue;
       }
 
-      // Fast poll (every 350ms) until the slot's <img> src changes OR CapCut removes input[type="file"]
-      for (let waitStep = 0; waitStep < 20; waitStep++) {
+      // Fast poll (every 350ms) until the slot's active <img> src changes to the new blob URL and finishes loading
+      for (let waitStep = 0; waitStep < 22; waitStep++) {
         await editorPage.waitForTimeout(350);
         const curState = await evalSafe(
           editorPage,
-          ({ sel, origSrc }) => {
+          ({ sel, origSrc, wasDirect }) => {
             const el = document.querySelector(sel);
             if (!el) return { changed: false, loading: false };
-            const img = el.querySelector('img');
+            const img = el.querySelector('img.tier-sprite-img') || el.querySelector('img');
             const curSrc = img ? img.src : '';
             const hasInput = Boolean(el.querySelector('input[type="file"]'));
-            const isChanged = Boolean((curSrc && curSrc !== origSrc) || !hasInput);
+            const isChanged = Boolean((curSrc && curSrc !== origSrc) || (wasDirect && !hasInput));
             const hasLoading = Boolean(el.querySelector('[class*="loading"], [class*="spin"], [class*="progress"]'));
             return { changed: isChanged, loading: hasLoading, curSrc };
           },
-          { sel: segSelector, origSrc: origImgSrc },
+          { sel: segSelector, origSrc: origImgSrc, wasDirect: directInputCount > 0 },
           4000,
           { changed: false, loading: false }
         );
 
         if (curState && curState.changed && !curState.loading) {
+          await editorPage.keyboard.press('Escape').catch(() => {});
           return true;
         }
       }
     }
+    await editorPage.keyboard.press('Escape').catch(() => {});
     return false;
   };
 
@@ -577,12 +729,15 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     } else {
       onLog(`⚠️ Ô #${i + 1}/${slotCount} phản hồi chậm, sẽ kiểm tra khóa lại ngay sau đây...`);
     }
-    // Short settle delay (800ms instead of 2500ms) since replaceSingleSlotVerified already confirmed replacement
-    await editorPage.waitForTimeout(800);
+    // Short settle delay (650ms) since replaceSingleSlotVerified already confirmed replacement
+    await editorPage.waitForTimeout(650);
   }
 
-  // Final post-loop audit: re-check all slots to guarantee ZERO slots reverted to or kept the template's original image!
+  // Final post-loop audit: re-check all slots to guarantee ZERO slots kept the previous/original image (unless intentionally using the same file)
   for (let i = 0; i < slotCount; i++) {
+    const fileToUse = videoFilePaths[i % videoFilePaths.length];
+    if (Array.isArray(prevUploadedFiles) && prevUploadedFiles[i] === fileToUse) continue;
+
     const segSelector = `.segment-item[data-mutable-index="${i}"]`;
     const origImgSrc = originalSlotImgs[i] || '';
     if (!origImgSrc) continue;
@@ -590,7 +745,7 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     const stillOriginal = await evalSafe(
       editorPage,
       ({ sel, origSrc }) => {
-        const img = document.querySelector(`${sel} img`);
+        const img = document.querySelector(`${sel} img.tier-sprite-img`) || document.querySelector(`${sel} img`);
         return Boolean(img && img.src === origSrc);
       },
       { sel: segSelector, origSrc: origImgSrc },
@@ -599,14 +754,14 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     );
 
     if (stillOriginal) {
-      const fileToUse = videoFilePaths[i % videoFilePaths.length];
-      onLog(`🛡️ Phát hiện Ô #${i + 1}/${slotCount} vẫn còn ảnh gốc của mẫu, đang cưỡng chế nạp lại: ${path.basename(fileToUse)}...`);
+      onLog(`🛡️ Phát hiện Ô #${i + 1}/${slotCount} chưa cập nhật ảnh mới, đang cưỡng chế nạp lại: ${path.basename(fileToUse)}...`);
       const retryOk = await replaceSingleSlotVerified(i, fileToUse);
       if (retryOk) filledCount++;
-      await editorPage.waitForTimeout(800);
+      await editorPage.waitForTimeout(650);
     }
   }
 
+  await editorPage.keyboard.press('Escape').catch(() => {});
   return filledCount;
 }
 
@@ -1022,10 +1177,21 @@ async function triggerExportAndSaveDownload({
       const state = await evalSafe(
         page,
         () => {
-          const bodyText = document.body ? (document.body.innerText || '') : '';
-          // IMPORTANT: Only match actual Export progress text, NEVER standalone percentages like editor zoom (50%/100%)!
-          const m = bodyText.match(/(?:Exporting|Đang xuất|Rendering|Đang kết xuất)[^%\d\n\r]{0,25}(\d{1,3})%/i);
-          const pctStr = m ? `${m[1]}%` : null;
+          const expIntEl = document.querySelector('.lv_exportProcess-container .lv-statistic-value-int');
+          const expIntText = expIntEl ? (expIntEl.innerText || '').trim() : '';
+          let pctStr = /^\d{1,3}$/.test(expIntText) ? `${expIntText}%` : null;
+
+          if (!pctStr) {
+            const bodyText = document.body ? (document.body.innerText || '') : '';
+            const mAfter = bodyText.match(/(?:Exporting|Đang xuất|Rendering|Đang kết xuất)[^%\d\n\r]{0,25}(\d{1,3})(?:\.\d+)?%/i);
+            const mBefore = bodyText.match(/(\d{1,3})(?:\.\d+)?\s*%\s*(?:Exporting|Đang xuất|Rendering|Đang kết xuất)/i);
+            const matchedNum = (mAfter && mAfter[1]) || (mBefore && mBefore[1]);
+            if (matchedNum) pctStr = `${matchedNum}%`;
+          }
+
+          const expProc = document.querySelector('.lv_exportProcess-container');
+          const hasExportProcessModal = Boolean(expProc && expProc.getBoundingClientRect().width > 100);
+
           const confirmBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
             c => c.offsetParent !== null && !c.disabled && !c.classList.contains('lv-btn-disabled')
           );
@@ -1035,7 +1201,7 @@ async function triggerExportAndSaveDownload({
             const t = (b.innerText || '').trim();
             return (t === 'Download' || t === 'Tải xuống') && b.id !== 'export-confirm-button';
           });
-          return { pctStr, hasConfirm, hasManualDlBtn };
+          return { pctStr, hasExportProcessModal, hasConfirm, hasManualDlBtn };
         },
         null,
         3500,
@@ -1044,11 +1210,11 @@ async function triggerExportAndSaveDownload({
 
       if (!state) return;
 
-      if (state.pctStr) {
+      if (state.pctStr || state.hasExportProcessModal) {
         hasStartedExporting = true;
         confirmStillVisibleTicks = 0;
         idleNotExportingTicks = 0;
-        onRenderPercent(state.pctStr);
+        if (state.pctStr) onRenderPercent(state.pctStr);
       } else if (state.hasConfirm && activeDownloadEvents === 0) {
         // Wait 2 consecutive ticks (~6s) before re-clicking #export-confirm-button so we never send duplicate export requests
         idleNotExportingTicks = 0;
@@ -1109,6 +1275,7 @@ async function triggerExportAndSaveDownload({
         const download = await downloadPromise;
         clearInterval(pollTimer);
         await download.saveAs(outPath);
+        await returnToEditorOnSameTab(page).catch(() => {});
         return;
       } catch (dlErr) {
         if (dlAttempt >= 3) {
@@ -1516,23 +1683,29 @@ async function releaseSharedBrowserContext(allVerified, onLog) {
   if (activeBatchCount > 0 || !sharedBrowserContext) {
     return;
   }
-  const ctxToClose = sharedBrowserContext;
-  sharedBrowserContext = null;
+  const activeCtx = sharedBrowserContext;
   (async () => {
     try {
-      const capcutPage = ctxToClose.pages().find(p => p.url().includes('capcut.com')) || ctxToClose.pages()[ctxToClose.pages().length - 1];
-      if (capcutPage) {
+      const openPages = activeCtx.pages().filter(p => !p.isClosed());
+      // Keep at most GLOBAL_MAX_CONCURRENCY warm editor tabs open so the next batch or stream reuses them immediately!
+      for (let i = GLOBAL_MAX_CONCURRENCY; i < openPages.length; i++) {
+        if (!openPages[i]._inUseByWorker) {
+          try { await openPages[i].close(); } catch {}
+        }
+      }
+      const capcutPage =
+        activeCtx.pages().find(p => !p.isClosed() && p.url().includes('capcut.com')) ||
+        activeCtx.pages()[0];
+      if (capcutPage && allVerified) {
         await cleanupCapCutCloudSpace(capcutPage, onLog).catch(() => {});
       }
-    } catch {} finally {
-      try { await ctxToClose.close(); } catch {}
-    }
+    } catch {}
   })();
 }
 
 /**
- * Run N paired jobs IN PARALLEL across multiple non-throttled tabs inside our shared persistent Chrome profile!
- * Cleans up CapCut Cloud Space ONLY ONCE at the very end after all active batches have safely downloaded and verified their MP4 files.
+ * Run N paired jobs IN PARALLEL across persistent non-throttled tabs inside our shared Chrome profile!
+ * Reuses each open CapCut editor tab across consecutive videos without closing/reopening tabs or reloading the editor.
  */
 async function runCapCutWebParallelBatch({
   templateInfo,
@@ -1553,6 +1726,7 @@ async function runCapCutWebParallelBatch({
   } else if (templateInfo.editorUrl) {
     targetEditorUrl = templateInfo.editorUrl;
   }
+  const targetTemplateKey = String((templateInfo && templateInfo.templateId) || targetEditorUrl);
 
   const batchId = nextBatchSeq++;
   const tplLockKey = String((templateInfo && (templateInfo.templateId || templateInfo.title)) || 'default_tpl');
@@ -1603,194 +1777,242 @@ async function runCapCutWebParallelBatch({
     onProgress(highestProgress, statusText);
   };
 
-  const runSingleTabWorker = async (jobIdx) => {
+  // Acquire or reuse an existing idle tab in sharedBrowserContext
+  const acquireWorkerPage = async () => {
+    const activeCtx = await getHealthySharedContext();
+    if (controller.cancelled) return null;
+    const openPages = activeCtx.pages().filter(p => !p.isClosed() && !p._inUseByWorker);
+    // Prefer a tab already open on the same template, otherwise any idle tab
+    let page =
+      openPages.find(p => p._templateKey === targetTemplateKey && p.url().includes('capcut.com/editor-template')) ||
+      openPages.find(p => p.url().includes('capcut.com/editor-template')) ||
+      openPages[0] ||
+      null;
+    if (!page) {
+      page = await activeCtx.newPage();
+    }
+    page._inUseByWorker = true;
+    controller.pages.add(page);
+    await hidePageWindowOffscreen(page);
+    await enablePageMultiDownloads(page);
+    return page;
+  };
+
+  const runJobOnPersistentPage = async (jobIdx, getOrResetPage) => {
     if (controller.cancelled) return null;
     const pairNum = jobIdx + 1;
     const fileSet = batchFileSets[jobIdx];
     const tag = `[Luồng #${pairNum}/${totalJobs}]`;
+    const fileLabel = fileSet
+      .map(f => path.basename(f).replace(/^p\d+_s\d+_/, '').replace(/^\d+_\d+_/, ''))
+      .join(' + ');
 
-    // Launch first 2 tabs immediately (350ms apart); stagger tabs 3..4 by 1.8s so a 2nd machine clicking within a few seconds immediately gets 2 parallel slots (2+2 = 4)!
-    if (jobIdx < 2) {
-      await new Promise(r => setTimeout(r, jobIdx * 350));
-    } else {
-      await new Promise(r => setTimeout(r, 1200 + (jobIdx - 1) * 1800));
-    }
-    if (controller.cancelled) return null;
-    await acquireGlobalTabSlot(batchId);
-
-    try {
+    for (let workerTry = 1; workerTry <= 2; workerTry++) {
       if (controller.cancelled) return null;
-      for (let workerTry = 1; workerTry <= 2; workerTry++) {
-        if (controller.cancelled) return null;
-        let page = null;
-        let watchdogTimer = null;
-        try {
-          const activeCtx = await getHealthySharedContext();
-          if (controller.cancelled) return null;
-          page = await activeCtx.newPage();
-          if (controller.cancelled) {
-            try { await page.close(); } catch {}
-            return null;
+      let watchdogTimer = null;
+      let page = null;
+      try {
+        page = await getOrResetPage(workerTry > 1);
+        if (!page || controller.cancelled) return null;
+
+        const executeAttempt = async () => {
+          await hidePageWindowOffscreen(page);
+          await enablePageMultiDownloads(page);
+
+          jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 10);
+          emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
+
+          const curUrl = page.url() || '';
+          const isSameTemplateTab =
+            workerTry === 1 &&
+            page._templateKey === targetTemplateKey &&
+            curUrl.includes('capcut.com/editor-template');
+
+          let reusedInPlace = false;
+          if (isSameTemplateTab) {
+            reusedInPlace = await returnToEditorOnSameTab(page);
           }
-          controller.pages.add(page);
 
-          const executeAttempt = async () => {
-            await hidePageWindowOffscreen(page);
-            await enablePageMultiDownloads(page);
-
-            jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 10);
-            emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
-            onLog(
-              `${tag} ${workerTry > 1 ? '[Thử lại] ' : ''}Đang mở mẫu và nạp cặp file #${pairNum}: ${fileSet
-                .map(f => path.basename(f).replace(/^p\d+_s\d+_/, '').replace(/^\d+_\d+_/, ''))
-                .join(' + ')}...`
-            );
+          if (reusedInPlace) {
+            onLog(`${tag} ♻️ Thay trực tiếp cặp file #${pairNum} ngay trên tab CapCut đang mở (${fileLabel}) và xuất tiếp luôn...`);
+            await page.waitForTimeout(350);
+          } else {
+            onLog(`${tag} ${workerTry > 1 ? '[Thử lại] ' : ''}Đang mở mẫu và nạp cặp file #${pairNum}: ${fileLabel}...`);
             await acquireEditorOpenGate();
             if (controller.cancelled) throw new Error('RENDER_CANCELLED');
             await page.goto(targetEditorUrl, { waitUntil: 'domcontentloaded', timeout: 50000 });
             if (controller.cancelled) throw new Error('RENDER_CANCELLED');
             await page.waitForSelector('.segment-item[data-mutable-index], .segment-item input[type="file"]', { timeout: 30000 }).catch(() => {});
             await page.waitForTimeout(1200);
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+            page._lastUploadedFiles = null;
+          }
 
-            const filledCount = await fillTemplateSlotsOnEditor(page, fileSet, (m) => {
+          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+
+          const filledCount = await fillTemplateSlotsOnEditor(
+            page,
+            fileSet,
+            (m) => {
               if (!controller.cancelled) onLog(`${tag} ${m}`);
-            });
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
-            if (filledCount === 0) {
-              throw new Error(`${tag} Không tìm thấy các ô phân đoạn của mẫu.`);
-            }
+            },
+            reusedInPlace ? page._lastUploadedFiles : null
+          );
+          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          if (filledCount === 0) {
+            throw new Error(`${tag} Không tìm thấy các ô phân đoạn của mẫu.`);
+          }
 
-            jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 25);
-            emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
+          page._templateKey = targetTemplateKey;
+          page._lastUploadedFiles = Array.from({ length: filledCount }, (_, sIdx) => fileSet[sIdx % fileSet.length]);
 
-            await page.waitForTimeout(600);
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 25);
+          emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
 
-            const exportDialogReady = await openExportConfirmDialog(page);
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
-            if (!exportDialogReady) {
-              throw new Error(`${tag} Nút xuất video trên CapCut chưa sẵn sàng (có thể do 1 phân đoạn chưa tải xong).`);
-            }
+          await page.waitForTimeout(500);
+          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
 
-            jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 30);
-            emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
-            onLog(`${tag} Đang kết xuất (Render) MP4 song song...`);
+          const exportDialogReady = await openExportConfirmDialog(page);
+          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          if (!exportDialogReady) {
+            throw new Error(`${tag} Nút xuất video trên CapCut chưa sẵn sàng (có thể do 1 phân đoạn chưa tải xong).`);
+          }
 
-            const { folderName, dir: tplOutDir } = getTemplateOutputDir(templateInfo);
-            const outFilename = buildOutputVideoFilename(pairNum, templateInfo, batchTimeTag);
-            const outPath = path.join(tplOutDir, outFilename);
+          jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 30);
+          emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
+          onLog(`${tag} Đang kết xuất (Render) MP4...`);
 
-            await triggerExportAndSaveDownload({
-              page,
-              outPath,
-              tag,
-              onLog: (m) => {
-                if (!controller.cancelled) onLog(m);
-              },
-              onRenderPercent: (pctInfo) => {
-                if (controller.cancelled) return;
-                const numMatch = pctInfo.match(/(\d{1,3})/);
-                if (numMatch) {
-                  const renderPct = Math.min(100, parseInt(numMatch[1], 10));
-                  jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 30 + Math.round(renderPct * 0.65));
-                }
-                emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
+          const { folderName, dir: tplOutDir } = getTemplateOutputDir(templateInfo);
+          const outFilename = buildOutputVideoFilename(pairNum, templateInfo, batchTimeTag);
+          const outPath = path.join(tplOutDir, outFilename);
+
+          await triggerExportAndSaveDownload({
+            page,
+            outPath,
+            tag,
+            onLog: (m) => {
+              if (!controller.cancelled) onLog(m);
+            },
+            onRenderPercent: (pctInfo) => {
+              if (controller.cancelled) return;
+              const numMatch = pctInfo.match(/(\d{1,3})/);
+              if (numMatch) {
+                const renderPct = Math.min(100, parseInt(numMatch[1], 10));
+                jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 30 + Math.round(renderPct * 0.65));
               }
+              emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
+            }
+          });
+          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+
+          const fileSize = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
+          const inputSignature = getPairInputSignature(fileSet);
+          let overwrittenList = [];
+          if (fileSize > 200 * 1024) {
+            overwrittenList = overwritePreviousPairOutputs({
+              tplOutDir,
+              outFilename,
+              pairNum,
+              templateInfo,
+              inputSignature
             });
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          }
 
-            const fileSize = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
-            const inputSignature = getPairInputSignature(fileSet);
-            let overwrittenList = [];
-            if (fileSize > 200 * 1024) {
-              overwrittenList = overwritePreviousPairOutputs({
-                tplOutDir,
-                outFilename,
-                pairNum,
-                templateInfo,
-                inputSignature
-              });
-            }
-
-            completedCount++;
-            jobProgress[jobIdx] = 100;
-            const outItem = {
-              success: true,
-              pairIndex: pairNum,
-              inputSignature,
-              overwritten: overwrittenList.length > 0,
-              engine: 'capcut_web_parallel',
-              folderName,
-              filename: outFilename,
-              url: `/outputs/${folderName}/${outFilename}`,
-              downloadUrl: `/api/download/${encodeURIComponent(outFilename)}`,
-              filePath: outPath,
-              size: fileSize
-            };
-            results[jobIdx] = outItem;
-
-            emitMonotonicProgress(`Đã tạo xong ${completedCount}/${totalJobs} video (${outFilename})`);
-            if (overwrittenList.length > 0) {
-              onLog(`${tag} Đã ghi đè Video #${pairNum}: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
-            } else {
-              onLog(`${tag} Đã tạo xong Video #${pairNum}: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
-            }
-            try { onVideoReady(outItem); } catch {}
-
-            const durationSec = await probeDurationSafe(outPath);
-            if (!(fileSize > 200 * 1024 && durationSec > 0.5)) {
-              allVerified = false;
-              onLog(`⚠️ ${tag} File tải về chưa đạt kiểm tra dung lượng/thời lượng, sẽ giữ nguyên Cloud!`);
-            }
+          completedCount++;
+          jobProgress[jobIdx] = 100;
+          const outItem = {
+            success: true,
+            pairIndex: pairNum,
+            inputSignature,
+            overwritten: overwrittenList.length > 0,
+            engine: 'capcut_web_parallel',
+            folderName,
+            filename: outFilename,
+            url: `/outputs/${folderName}/${outFilename}`,
+            downloadUrl: `/api/download/${encodeURIComponent(outFilename)}`,
+            filePath: outPath,
+            size: fileSize
           };
+          results[jobIdx] = outItem;
 
-          await Promise.race([
-            executeAttempt(),
-            new Promise((_, reject) => {
-              watchdogTimer = setTimeout(() => {
-                reject(new Error(`${tag} Quá thời gian xử lý luồng (300s)`));
-              }, 300000);
-            })
-          ]);
+          emitMonotonicProgress(`Đã tạo xong ${completedCount}/${totalJobs} video (${outFilename})`);
+          if (overwrittenList.length > 0) {
+            onLog(`${tag} Đã ghi đè Video #${pairNum}: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+          } else {
+            onLog(`${tag} Đã tạo xong Video #${pairNum}: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+          }
+          try { onVideoReady(outItem); } catch {}
 
-          if (watchdogTimer) clearTimeout(watchdogTimer);
-          if (page) controller.pages.delete(page);
-          const isLastSurvivor = (jobIdx === totalJobs - 1) && (activeBatchCount === 1);
-          if (!isLastSurvivor && page) {
-            try { await page.close(); } catch {}
+          const durationSec = await probeDurationSafe(outPath);
+          if (!(fileSize > 200 * 1024 && durationSec > 0.5)) {
+            allVerified = false;
+            onLog(`⚠️ ${tag} File tải về chưa đạt kiểm tra dung lượng/thời lượng, sẽ giữ nguyên Cloud!`);
           }
-          return results[jobIdx];
-        } catch (err) {
-          if (watchdogTimer) clearTimeout(watchdogTimer);
-          if (page) {
-            controller.pages.delete(page);
-            try { await page.close(); } catch {}
-          }
-          if (controller.cancelled || (err && err.message === 'RENDER_CANCELLED')) {
-            return null;
-          }
-          if (workerTry < 2) {
-            onLog(`🔄 ${tag} Gặp sự cố (${err.message}), đang tự động khởi tạo lại tab mới để xuất lại Video #${pairNum}...`);
-            await new Promise(r => setTimeout(r, 1500));
-            continue;
-          }
-          allVerified = false;
-          onLog(`❌ ${tag} Lỗi: ${err.message}`);
+        };
+
+        await Promise.race([
+          executeAttempt(),
+          new Promise((_, reject) => {
+            watchdogTimer = setTimeout(() => {
+              reject(new Error(`${tag} Quá thời gian xử lý luồng (300s)`));
+            }, 300000);
+          })
+        ]);
+
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        return results[jobIdx];
+      } catch (err) {
+        if (watchdogTimer) clearTimeout(watchdogTimer);
+        if (controller.cancelled || (err && err.message === 'RENDER_CANCELLED')) {
           return null;
         }
+        if (page) {
+          page._templateKey = null;
+          page._lastUploadedFiles = null;
+        }
+        if (workerTry < 2) {
+          onLog(`🔄 ${tag} Gặp sự cố (${err.message}), đang tự động làm mới lại tab để xuất lại Video #${pairNum}...`);
+          await new Promise(r => setTimeout(r, 1200));
+          continue;
+        }
+        allVerified = false;
+        onLog(`❌ ${tag} Lỗi: ${err.message}`);
+        return null;
       }
-    } finally {
-      releaseGlobalTabSlot();
     }
+    return null;
   };
 
   try {
     let nextJobIdx = 0;
-    const workerPool = Array.from({ length: concurrency }, async () => {
-      while (nextJobIdx < totalJobs && !controller.cancelled) {
-        const myIdx = nextJobIdx++;
-        await runSingleTabWorker(myIdx);
+    const workerPool = Array.from({ length: concurrency }, async (_, workerIdx) => {
+      if (workerIdx > 0) {
+        await new Promise(r => setTimeout(r, workerIdx * 450));
+      }
+      if (controller.cancelled) return;
+      await acquireGlobalTabSlot(batchId);
+      let workerPage = null;
+      try {
+        const getOrResetPage = async (forceReset = false) => {
+          if (controller.cancelled) return null;
+          if (!workerPage || workerPage.isClosed()) {
+            workerPage = await acquireWorkerPage();
+          } else if (forceReset) {
+            workerPage._templateKey = null;
+            workerPage._lastUploadedFiles = null;
+          }
+          return workerPage;
+        };
+
+        while (nextJobIdx < totalJobs && !controller.cancelled) {
+          const myIdx = nextJobIdx++;
+          await runJobOnPersistentPage(myIdx, getOrResetPage);
+        }
+      } finally {
+        if (workerPage) {
+          workerPage._inUseByWorker = false;
+          controller.pages.delete(workerPage);
+        }
+        releaseGlobalTabSlot();
       }
     });
     await Promise.all(workerPool);
