@@ -446,7 +446,36 @@ const MEDIA_FILE_REGEX = /\.(mp4|mov|webm|mkv|avi|m4v|mts|m2ts|ts|wmv|flv|f4v|3g
 const CONVERT_TO_JPG_REGEX = /\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i;
 const CONVERT_TO_MP4_REGEX = /\.(mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i;
 
-const heicConvert = require('heic-convert');
+let heicConvert = null;
+try {
+  heicConvert = require('heic-convert');
+} catch {
+  // Auto-install heic-convert in background if user ran git pull without npm install
+  try {
+    const { exec } = require('child_process');
+    exec('npm install heic-convert --no-audit --no-fund', { cwd: __dirname }, () => {
+      try {
+        heicConvert = require('heic-convert');
+      } catch {}
+    });
+  } catch {}
+}
+
+async function getHeicConverter() {
+  if (heicConvert) return heicConvert;
+  try {
+    heicConvert = require('heic-convert');
+    return heicConvert;
+  } catch {}
+  await new Promise((resolve) => {
+    const { exec } = require('child_process');
+    exec('npm install heic-convert --no-audit --no-fund', { cwd: __dirname, timeout: 60000 }, () => resolve());
+  });
+  try {
+    heicConvert = require('heic-convert');
+  } catch {}
+  return heicConvert;
+}
 
 async function normalizeUploadedMediaIfNeeded(filePath) {
   if (!filePath || !fs.existsSync(filePath)) {
@@ -461,14 +490,17 @@ async function normalizeUploadedMediaIfNeeded(filePath) {
 
     if (isHeic) {
       try {
-        const inputBuffer = await fs.promises.readFile(filePath);
-        const outputBuffer = await heicConvert({
-          buffer: inputBuffer,
-          format: 'JPEG',
-          quality: 0.92
-        });
-        await fs.promises.writeFile(jpgPath, Buffer.from(outputBuffer));
-        converted = true;
+        const converter = await getHeicConverter();
+        if (converter) {
+          const inputBuffer = await fs.promises.readFile(filePath);
+          const outputBuffer = await converter({
+            buffer: inputBuffer,
+            format: 'JPEG',
+            quality: 0.92
+          });
+          await fs.promises.writeFile(jpgPath, Buffer.from(outputBuffer));
+          converted = true;
+        }
       } catch {}
     }
 
