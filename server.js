@@ -46,6 +46,10 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ noServer: true });
 
+process.on('unhandledRejection', (err) => {
+  console.warn('[WARN] Ignored async rejection:', err && err.message ? err.message : err);
+});
+
 // ============================================================================
 // SECURITY: Server-Side PIN Gate & Anti-Scraper Protection
 // ============================================================================
@@ -1175,7 +1179,7 @@ app.post('/api/render', async (req, res) => {
       const canRunOnWebBot = isRealCapCutWebUrl || hasValidTemplateId;
 
       const tplIdStr = String(template.templateId || '');
-      logToClient(`🚀 Đang kích hoạt ${batchFileSets.length} luồng ghép video (tối ưu 2 luồng/lượt cho VPS, 1-1 -> ${batchFileSets.length}-${batchFileSets.length})...`, 'info');
+      logToClient(`🚀 Đang kích hoạt ${batchFileSets.length} luồng ghép video (tối đa 5 luồng/lượt song song, 1-1 -> ${batchFileSets.length}-${batchFileSets.length})...`, 'info');
 
       // Respond immediately (<100ms) so Cloudflare's 100-second HTTP proxy timeout (Error 524) NEVER interrupts the client UI!
       res.json({
@@ -1190,7 +1194,7 @@ app.post('/api/render', async (req, res) => {
           const renderedOutputs = await runCapCutWebParallelBatch({
             templateInfo: template,
             batchFileSets,
-            maxConcurrency: 2,
+            maxConcurrency: 5,
             onLog: (msg) => logToClient(msg, 'info'),
             onProgress: (percent, status) => {
               const lockEntry = activeRenderingTemplates.get(tplLockKey);
@@ -1717,6 +1721,92 @@ app.get('/api/outputs', (req, res) => {
     const filterTemplateId = req.query.templateId ? String(req.query.templateId) : null;
     const outputs = getMergedOutputsList(filterTemplateId);
     res.json({ success: true, outputs });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+function openExplorerWindowToFront(targetDir, selectFilePath = null) {
+  const { exec, spawn } = require('child_process');
+  const resolvedDir = path.resolve(targetDir);
+  const resolvedFile = selectFilePath && fs.existsSync(selectFilePath) ? path.resolve(selectFilePath) : null;
+  const explorerArg = resolvedFile ? `/select,"${resolvedFile}"` : `"${resolvedDir}"`;
+
+  // 1. Immediately launch explorer.exe with /select,"..."
+  exec(`explorer.exe ${explorerArg}`, { windowsHide: false }, () => {});
+
+  // 2. Use PowerShell -EncodedCommand (so quotes in C# Add-Type are never stripped!) to bring Explorer to the foreground
+  const psScript = `
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Fg {
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+  [DllImport("user32.dll")] public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+  [DllImport("user32.dll")] public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+  [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, int dwExtraInfo);
+}
+"@
+[Win32Fg]::keybd_event(0x12, 0, 2, 0)
+Start-Sleep -Milliseconds 350
+$h = [Win32Fg]::FindWindow("CabinetWClass", $null)
+if ($h -ne [IntPtr]::Zero) {
+  [Win32Fg]::ShowWindow($h, 9) | Out-Null
+  [Win32Fg]::SetForegroundWindow($h) | Out-Null
+  [Win32Fg]::SwitchToThisWindow($h, $true)
+}
+`;
+  const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+  const child = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true
+  });
+  child.unref();
+}
+
+// 11b. Open local folder containing the generated videos in Windows Explorer
+app.post('/api/outputs/open-folder', (req, res) => {
+  try {
+    const { filename = '', templateId = '', templateTitle = '', folderName = '' } = req.body || {};
+    let targetDir = OUTPUT_DIR;
+    let selectFilePath = null;
+
+    if (filename) {
+      const found = findOutputFileOnDisk(filename);
+      if (found && fs.existsSync(found.fullPath)) {
+        selectFilePath = found.fullPath;
+        targetDir = path.dirname(found.fullPath);
+      }
+    }
+
+    if (!selectFilePath) {
+      if (folderName) {
+        const candidate = path.join(OUTPUT_DIR, path.basename(String(folderName)));
+        if (fs.existsSync(candidate)) {
+          targetDir = candidate;
+        }
+      }
+      if (targetDir === OUTPUT_DIR && (templateId || templateTitle)) {
+        const { dir } = getTemplateOutputDir({ templateId, title: templateTitle });
+        targetDir = dir;
+      }
+    }
+
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    if (!selectFilePath) {
+      const mp4s = fs.readdirSync(targetDir).filter(f => f.toLowerCase().endsWith('.mp4')).sort();
+      if (mp4s.length > 0) {
+        selectFilePath = path.join(targetDir, mp4s[0]);
+      }
+    }
+
+    openExplorerWindowToFront(targetDir, selectFilePath);
+    res.json({ success: true, path: targetDir, selectedFile: selectFilePath });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }

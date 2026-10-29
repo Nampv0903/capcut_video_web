@@ -32,6 +32,81 @@ function probeDurationSafe(filePath) {
   });
 }
 
+function probeAudioStreamBitrate(filePath) {
+  return new Promise((resolve) => {
+    execFile(
+      'ffprobe',
+      ['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'stream=codec_name,bit_rate', '-of', 'json', filePath],
+      (err, stdout) => {
+        if (err) return resolve(null);
+        try {
+          const data = JSON.parse(stdout);
+          const s = (data.streams && data.streams[0]) || null;
+          if (!s || !s.codec_name) return resolve(null);
+          resolve({ codec: s.codec_name, bitRate: parseInt(s.bit_rate || '64000', 10) || 64000 });
+        } catch {
+          resolve(null);
+        }
+      }
+    );
+  });
+}
+
+/**
+ * Ensure the exported video uses the exact 100% original audio stream (pitch, tone, speed, effects)
+ * from the cached original template preview video (`cache/templates/template_<id>.mp4`) without re-encoding video.
+ */
+async function syncOriginalTemplateAudio(outPath, templateInfo) {
+  try {
+    if (!outPath || !fs.existsSync(outPath)) return false;
+    const tplId = String((templateInfo && templateInfo.templateId) || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    const candidates = [];
+    if (templateInfo && templateInfo.localVideoPath) candidates.push(templateInfo.localVideoPath);
+    if (tplId) {
+      candidates.push(path.join(__dirname, '..', 'cache', 'templates', `template_${tplId}.mp4`));
+    }
+    const tplVideoPath = candidates.find((p) => p && fs.existsSync(p) && fs.statSync(p).size > 20 * 1024);
+    if (!tplVideoPath) return false;
+
+    const [outDur, tplDur, audInfo] = await Promise.all([
+      probeDurationSafe(outPath),
+      probeDurationSafe(tplVideoPath),
+      probeAudioStreamBitrate(tplVideoPath)
+    ]);
+    if (!outDur || !tplDur || Math.abs(outDur - tplDur) > 1.5) return false;
+    if (!audInfo || audInfo.bitRate < 16000) return false;
+
+    const tmpOutPath = `${outPath}.audio_sync_${Date.now()}.mp4`;
+    const ok = await new Promise((resolve) => {
+      execFile(
+        'ffmpeg',
+        [
+          '-y',
+          '-v', 'error',
+          '-i', outPath,
+          '-i', tplVideoPath,
+          '-map', '0:v:0',
+          '-map', '1:a:0',
+          '-c:v', 'copy',
+          '-c:a', 'copy',
+          '-shortest',
+          '-movflags', '+faststart',
+          tmpOutPath
+        ],
+        (err) => resolve(!err)
+      );
+    });
+    if (ok && fs.existsSync(tmpOutPath) && fs.statSync(tmpOutPath).size > 200 * 1024) {
+      fs.renameSync(tmpOutPath, outPath);
+      return true;
+    }
+    if (fs.existsSync(tmpOutPath)) {
+      try { fs.unlinkSync(tmpOutPath); } catch {}
+    }
+  } catch {}
+  return false;
+}
+
 function getBatchTimeTag(dateObj = new Date()) {
   const hh = String(dateObj.getHours()).padStart(2, '0');
   const mm = String(dateObj.getMinutes()).padStart(2, '0');
@@ -579,6 +654,166 @@ async function returnToEditorOnSameTab(page) {
 }
 
 /**
+ * Unblocks CapCut Web Editor template export when unused template assets fail EverCloud sync (sync2UserMaterialFailure)
+ * and patches dataSdk.getDraftStr() so transitions/effects with legacy source_platform=0 / empty third_resource_id
+ * are properly recognized and rendered by CapCut's Cloud Render Server.
+ */
+async function unblockCapCutTemplateSyncAndPatchTransitions(page) {
+  if (!page || page.isClosed()) return null;
+  return evalSafe(
+    page,
+    () => {
+      try {
+        document.querySelectorAll('.lv-modal-close-icon').forEach(x => {
+          const r = x.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) x.click();
+        });
+        document.querySelectorAll('.lv-modal-wrapper, .lv-modal-mask').forEach(m => {
+          const txt = m.innerText || '';
+          if (txt.includes('save project') || txt.includes('Refresh') || txt.includes('Không thể lưu')) {
+            m.remove();
+          }
+        });
+      } catch {}
+
+      const b2 =
+        Array.from(document.querySelectorAll('#export-video-btn')).find(el => el.getBoundingClientRect().left > 100) ||
+        document.querySelector('#export-video-btn');
+      if (!b2) return null;
+
+      const fk2 = Object.keys(b2).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+      let cur = fk2 ? b2[fk2] : null;
+      let compD = null;
+      while (cur) {
+        if (cur.memoizedProps && cur.memoizedProps.mainDraftService && !compD) {
+          compD = cur;
+          break;
+        }
+        cur = cur.return;
+      }
+      if (!compD || !compD.memoizedProps) return null;
+
+      const mp = compD.memoizedProps;
+      const mds = mp.mainDraftService.__origin__ || mp.mainDraftService;
+      if (!mds) return null;
+
+      // 1. Patch dataSdk.getDraftStr so cloud render server always receives valid third_resource_id & source_platform=1 for transitions/effects
+      // IMPORTANT: NEVER set third_resource_id on d.materials.effects (mix_mode / filter), because built-in blend modes ("Bộ lọc", "Làm sáng", "Trình chiếu")
+      // require third_resource_id: "" to use the engine's built-in /editor/effect/mix/... shader; setting third_resource_id on mix_mode breaks transparency
+      // and causes overlay tracks (like starlight MOVs) to render opaque black over Track 0!
+      const dataSdk = mds.dataSdk;
+      if (dataSdk && typeof dataSdk.getDraftStr === 'function' && dataSdk.__patchedGetDraftStrVersion !== 2) {
+        if (!dataSdk.__origGetDraftStr) {
+          dataSdk.__origGetDraftStr = dataSdk.getDraftStr.bind(dataSdk);
+        }
+        const origGetDraftStr = dataSdk.__origGetDraftStr;
+        dataSdk.getDraftStr = function (...args) {
+          const raw = origGetDraftStr(...args);
+          try {
+            const parsed = JSON.parse(raw);
+            const patchDraftObj = (d) => {
+              if (!d || typeof d !== 'object') return;
+              if (d.materials) {
+                if (Array.isArray(d.materials.transitions)) {
+                  for (const tr of d.materials.transitions) {
+                    if (tr && tr.resource_id && (!tr.third_resource_id || tr.source_platform === 0)) {
+                      tr.third_resource_id = tr.resource_id;
+                      tr.effect_id = tr.resource_id;
+                      tr.source_platform = 1;
+                    }
+                  }
+                }
+                if (Array.isArray(d.materials.video_effects)) {
+                  for (const ve of d.materials.video_effects) {
+                    if (ve && ve.resource_id && /^\d{15,}$/.test(String(ve.resource_id)) && ve.source_platform === 0) {
+                      ve.third_resource_id = ve.resource_id;
+                      ve.effect_id = ve.resource_id;
+                      ve.source_platform = 1;
+                    }
+                  }
+                }
+                if (Array.isArray(d.materials.audio_effects)) {
+                  for (const ae of d.materials.audio_effects) {
+                    if (ae && ae.resource_id && (!ae.third_resource_id || ae.source_platform === 0)) {
+                      ae.third_resource_id = ae.resource_id;
+                      ae.effect_id = ae.resource_id;
+                      ae.source_platform = 1;
+                    }
+                  }
+                }
+                if (Array.isArray(d.materials.drafts)) {
+                  for (const sub of d.materials.drafts) {
+                    if (sub && sub.draft) patchDraftObj(sub.draft);
+                  }
+                }
+              }
+              if (Array.isArray(d.tracks)) {
+                for (const track of d.tracks) {
+                  if (track && track.type === 'audio' && Array.isArray(track.segments)) {
+                    for (const seg of track.segments) {
+                      if (seg && typeof seg.speed === 'number' && Math.abs(seg.speed - 1) > 0.001 && seg.is_tone_modify === true) {
+                        seg.is_tone_modify = false;
+                      }
+                    }
+                  }
+                }
+              }
+            };
+            if (parsed && parsed.materials) {
+              patchDraftObj(parsed);
+              return JSON.stringify(parsed);
+            }
+          } catch {}
+          return raw;
+        };
+        dataSdk.__patchedGetDraftStr = true;
+        dataSdk.__patchedGetDraftStrVersion = 2;
+      }
+
+      // 2. Remove any failed autoGeneratedMaterials (e.g., sync2UserMaterialFailure) that permanently block #export-video-btn
+      const sm = mds._saveManager || mds.saveManager;
+      const dms = sm && (sm._draftMaterialsService ? (sm._draftMaterialsService.__origin__ || sm._draftMaterialsService) : null);
+      let removedFailedCount = 0;
+      if (dms && typeof dms.getMaterials === 'function') {
+        const mats = dms.getMaterials();
+        for (const m of [...((mats && mats.autoGeneratedMaterials) || [])]) {
+          if (m && m.status && m.status !== 'Success' && m.status !== 'uploading' && m.status !== 'syncing' && m.status !== 'transcoding') {
+            try {
+              dms.removeFromAutoGenerated(m.id);
+              removedFailedCount++;
+            } catch {}
+          }
+        }
+        const stillSyncing = typeof dms.hasMaterialSyncing === 'function' ? dms.hasMaterialSyncing() : false;
+        if (removedFailedCount > 0 || !stillSyncing) {
+          try { dms._checkAndNotifyMaterialDoneState(); } catch {}
+        }
+      }
+
+      const s = mp.store;
+      if (s && Array.isArray(s._autoGeneratedMaterials)) {
+        const filtered = s._autoGeneratedMaterials.filter(
+          m => !m || m.status === 'Success' || m.status === 'uploading' || m.status === 'syncing' || m.status === 'transcoding'
+        );
+        if (filtered.length !== s._autoGeneratedMaterials.length && typeof s.actionAutoGeneratedMaterialsSet === 'function') {
+          try { s.actionAutoGeneratedMaterialsSet(filtered); } catch {}
+        }
+      }
+
+      return {
+        patchedDraftStr: Boolean(dataSdk && dataSdk.__patchedGetDraftStr),
+        removedFailedCount,
+        isExportButtonDisable: s ? s.isExportButtonDisable : null,
+        trigger: s ? s.isExportButtonDisableTrigger : null
+      };
+    },
+    null,
+    4000,
+    null
+  );
+}
+
+/**
  * Fill template slots inside CapCut Web Editor using .segment-item[data-mutable-index] inputs
  * Supports BOTH fresh tabs (direct input[type="file"]) AND reused tabs (clicking .tier-inner button -> .menu-mutable input[type="file"])!
  */
@@ -600,6 +835,46 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
 
   if (slotCount === 0) {
     return 0;
+  }
+
+  // Wait up to 15s for CapCut Web Editor's timelineStore to finish unpacking the template (exportReady === true)
+  // before we start injecting user files into slots
+  for (let readyWait = 0; readyWait < 30; readyWait++) {
+    const isTplUnpacked = await evalSafe(
+      editorPage,
+      (expectedSlots) => {
+        const el = document.querySelector('.segment-item[data-mutable-index="0"]');
+        if (!el) return false;
+        const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        let cur = fk ? el[fk] : null;
+        let ts = null;
+        while (cur) {
+          if (cur.memoizedProps) {
+            if (cur.memoizedProps.timelineStore) {
+              ts = cur.memoizedProps.timelineStore;
+              break;
+            }
+            if (cur.memoizedProps.store && cur.memoizedProps.store.timelineStore) {
+              ts = cur.memoizedProps.store.timelineStore;
+              break;
+            }
+          }
+          cur = cur.return;
+        }
+        if (!ts) return true;
+        const segs =
+          ts.tracksMutable &&
+          ts.tracksMutable[0] &&
+          ts.tracksMutable[0][0] &&
+          ts.tracksMutable[0][0].segments;
+        return Boolean(ts.exportReady && Array.isArray(segs) && segs.length >= expectedSlots);
+      },
+      slotCount,
+      3000,
+      false
+    );
+    if (isTplUnpacked) break;
+    await editorPage.waitForTimeout(500);
   }
 
   onLog(`Đang tự động nhét ${videoFilePaths.length} file của đại ca vào ${slotCount} phân đoạn của mẫu (chạy ngầm 100%)...`);
@@ -632,7 +907,7 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     const segInput = editorPage.locator(`${segSelector} input[type="file"]`).first();
     const origImgSrc = originalSlotImgs[i] || '';
 
-    // If this reused tab already uploaded this exact same file into slot i on the previous run, no need to re-upload
+    // If this reused tab already uploaded this exact same file into slot i on the previous run AND MobX confirms seg.mutable.filled === true, no need to re-upload
     const hasDirectInputInit = (await segInput.count().catch(() => 0)) > 0;
     if (
       !hasDirectInputInit &&
@@ -640,7 +915,41 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
       prevUploadedFiles[i] === fileToUse &&
       origImgSrc.startsWith('blob:')
     ) {
-      return true;
+      const alreadyFilledMobx = await evalSafe(
+        editorPage,
+        ({ sel, slotIdx }) => {
+          const el = document.querySelector(sel);
+          if (!el) return false;
+          const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+          let cur = fk ? el[fk] : null;
+          let ts = null;
+          while (cur) {
+            if (cur.memoizedProps) {
+              if (cur.memoizedProps.timelineStore) {
+                ts = cur.memoizedProps.timelineStore;
+                break;
+              }
+              if (cur.memoizedProps.store && cur.memoizedProps.store.timelineStore) {
+                ts = cur.memoizedProps.store.timelineStore;
+                break;
+              }
+            }
+            cur = cur.return;
+          }
+          const seg =
+            ts &&
+            ts.tracksMutable &&
+            ts.tracksMutable[0] &&
+            ts.tracksMutable[0][0] &&
+            ts.tracksMutable[0][0].segments &&
+            ts.tracksMutable[0][0].segments[slotIdx];
+          return Boolean(seg && !seg.loading && seg.mutable && seg.mutable.filled);
+        },
+        { sel: segSelector, slotIdx: i },
+        3000,
+        false
+      );
+      if (alreadyFilledMobx) return true;
     }
 
     for (let retry = 1; retry <= 4; retry++) {
@@ -689,22 +998,60 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
         continue;
       }
 
-      // Fast poll (every 350ms) until the slot's active <img> src changes to the new blob URL and finishes loading
-      for (let waitStep = 0; waitStep < 22; waitStep++) {
+      // Fast poll (every 350ms, up to ~16s) until the slot's active <img> src changes AND MobX segment confirms filled === true & loading === false
+      for (let waitStep = 0; waitStep < 45; waitStep++) {
         await editorPage.waitForTimeout(350);
         const curState = await evalSafe(
           editorPage,
-          ({ sel, origSrc, wasDirect }) => {
+          ({ sel, origSrc, wasDirect, slotIdx }) => {
             const el = document.querySelector(sel);
             if (!el) return { changed: false, loading: false };
             const img = el.querySelector('img.tier-sprite-img') || el.querySelector('img');
             const curSrc = img ? img.src : '';
             const hasInput = Boolean(el.querySelector('input[type="file"]'));
-            const isChanged = Boolean((curSrc && curSrc !== origSrc) || (wasDirect && !hasInput));
-            const hasLoading = Boolean(el.querySelector('[class*="loading"], [class*="spin"], [class*="progress"]'));
+            let isChanged = Boolean((curSrc && curSrc !== origSrc) || (wasDirect && !hasInput));
+            let hasLoading = Boolean(el.querySelector('[class*="loading"], [class*="spin"], [class*="progress"]'));
+
+            // Verify MobX timelineStore segment state (via memoizedProps.store.timelineStore or memoizedProps.timelineStore)
+            try {
+              const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+              let cur = fk ? el[fk] : null;
+              let ts = null;
+              while (cur) {
+                if (cur.memoizedProps) {
+                  if (cur.memoizedProps.timelineStore) {
+                    ts = cur.memoizedProps.timelineStore;
+                    break;
+                  }
+                  if (cur.memoizedProps.store && cur.memoizedProps.store.timelineStore) {
+                    ts = cur.memoizedProps.store.timelineStore;
+                    break;
+                  }
+                }
+                cur = cur.return;
+              }
+              const seg =
+                ts &&
+                ts.tracksMutable &&
+                ts.tracksMutable[0] &&
+                ts.tracksMutable[0][0] &&
+                ts.tracksMutable[0][0].segments &&
+                ts.tracksMutable[0][0].segments[slotIdx];
+              if (seg) {
+                const segPath = String(seg.path || '');
+                if (seg.loading || segPath.startsWith('/.quick-import/') || segPath.includes('IOS_ALBUM')) {
+                  hasLoading = true;
+                }
+                if (seg.mutable) {
+                  if (!seg.mutable.filled) return { changed: false, loading: hasLoading, curSrc };
+                  isChanged = true;
+                }
+              }
+            } catch {}
+
             return { changed: isChanged, loading: hasLoading, curSrc };
           },
-          { sel: segSelector, origSrc: origImgSrc, wasDirect: directInputCount > 0 },
+          { sel: segSelector, origSrc: origImgSrc, wasDirect: directInputCount > 0, slotIdx: i },
           4000,
           { changed: false, loading: false }
         );
@@ -733,27 +1080,56 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     await editorPage.waitForTimeout(650);
   }
 
-  // Final post-loop audit: re-check all slots to guarantee ZERO slots kept the previous/original image (unless intentionally using the same file)
+  // Final post-loop audit: re-check all slots in both DOM and MobX timelineStore to guarantee ZERO slots kept the original template media
   for (let i = 0; i < slotCount; i++) {
     const fileToUse = videoFilePaths[i % videoFilePaths.length];
-    if (Array.isArray(prevUploadedFiles) && prevUploadedFiles[i] === fileToUse) continue;
-
     const segSelector = `.segment-item[data-mutable-index="${i}"]`;
     const origImgSrc = originalSlotImgs[i] || '';
-    if (!origImgSrc) continue;
+    const sameAsPrevRun = Array.isArray(prevUploadedFiles) && prevUploadedFiles[i] === fileToUse;
 
-    const stillOriginal = await evalSafe(
+    const needsRefill = await evalSafe(
       editorPage,
-      ({ sel, origSrc }) => {
-        const img = document.querySelector(`${sel} img.tier-sprite-img`) || document.querySelector(`${sel} img`);
-        return Boolean(img && img.src === origSrc);
+      ({ sel, origSrc, slotIdx, isSameAsPrev }) => {
+        const el = document.querySelector(sel);
+        if (!el) return false;
+        const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        let cur = fk ? el[fk] : null;
+        let ts = null;
+        while (cur) {
+          if (cur.memoizedProps) {
+            if (cur.memoizedProps.timelineStore) {
+              ts = cur.memoizedProps.timelineStore;
+              break;
+            }
+            if (cur.memoizedProps.store && cur.memoizedProps.store.timelineStore) {
+              ts = cur.memoizedProps.store.timelineStore;
+              break;
+            }
+          }
+          cur = cur.return;
+        }
+        const seg =
+          ts &&
+          ts.tracksMutable &&
+          ts.tracksMutable[0] &&
+          ts.tracksMutable[0][0] &&
+          ts.tracksMutable[0][0].segments &&
+          ts.tracksMutable[0][0].segments[slotIdx];
+        if (seg && seg.mutable && !seg.mutable.filled) {
+          return true;
+        }
+        if (!isSameAsPrev && origSrc) {
+          const img = el.querySelector('img.tier-sprite-img') || el.querySelector('img');
+          if (img && img.src === origSrc) return true;
+        }
+        return false;
       },
-      { sel: segSelector, origSrc: origImgSrc },
+      { sel: segSelector, origSrc: origImgSrc, slotIdx: i, isSameAsPrev: sameAsPrevRun },
       4000,
       false
     );
 
-    if (stillOriginal) {
+    if (needsRefill) {
       onLog(`🛡️ Phát hiện Ô #${i + 1}/${slotCount} chưa cập nhật ảnh mới, đang cưỡng chế nạp lại: ${path.basename(fileToUse)}...`);
       const retryOk = await replaceSingleSlotVerified(i, fileToUse);
       if (retryOk) filledCount++;
@@ -761,6 +1137,97 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     }
   }
 
+  // Wait up to 30s for all user-uploaded slot files to finish .quick-import and cloud material upload (userGeneratedMaterials === 'Success')
+  // so #export-video-btn is immediately clickable and CapCut's Cloud Render Server has 100% of the user's uploaded media on Track 0!
+  for (let syncStep = 0; syncStep < 60; syncStep++) {
+    await unblockCapCutTemplateSyncAndPatchTransitions(editorPage).catch(() => {});
+    const syncState = await evalSafe(
+      editorPage,
+      (count) => {
+        const el = document.querySelector('.segment-item[data-mutable-index="0"]');
+        if (!el) return { ready: true };
+        const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+        let cur = fk ? el[fk] : null;
+        let ts = null;
+        while (cur) {
+          if (cur.memoizedProps) {
+            if (cur.memoizedProps.timelineStore) {
+              ts = cur.memoizedProps.timelineStore;
+              break;
+            }
+            if (cur.memoizedProps.store && cur.memoizedProps.store.timelineStore) {
+              ts = cur.memoizedProps.store.timelineStore;
+              break;
+            }
+          }
+          cur = cur.return;
+        }
+        const segs =
+          ts &&
+          ts.tracksMutable &&
+          ts.tracksMutable[0] &&
+          ts.tracksMutable[0][0] &&
+          ts.tracksMutable[0][0].segments;
+        if (Array.isArray(segs)) {
+          for (let i = 0; i < Math.min(count, segs.length); i++) {
+            const s = segs[i];
+            if (!s) continue;
+            const sp = String(s.path || '');
+            if (s.loading || sp.startsWith('/.quick-import/') || sp.includes('IOS_ALBUM') || (s.mutable && !s.mutable.filled)) {
+              return { ready: false, reason: `slot_${i}_importing` };
+            }
+          }
+        }
+
+        const expBtns = Array.from(document.querySelectorAll('#export-video-btn')).filter(
+          b => b.getBoundingClientRect().left > 100
+        );
+        if (expBtns.length > 0) {
+          const btn = expBtns[0];
+          const fk2 = Object.keys(btn).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+          let c2 = fk2 ? btn[fk2] : null;
+          let compD = null;
+          while (c2) {
+            if (c2.memoizedProps && c2.memoizedProps.mainDraftService) {
+              compD = c2;
+              break;
+            }
+            c2 = c2.return;
+          }
+          if (compD && compD.memoizedProps) {
+            const mds = compD.memoizedProps.mainDraftService.__origin__ || compD.memoizedProps.mainDraftService;
+            const sm = mds && (mds._saveManager || mds.saveManager);
+            const dms = sm && sm._draftMaterialsService ? (sm._draftMaterialsService.__origin__ || sm._draftMaterialsService) : null;
+            if (dms) {
+              if (typeof dms.hasMaterialSyncing === 'function' && dms.hasMaterialSyncing()) {
+                return { ready: false, reason: 'dms_syncing' };
+              }
+              if (typeof dms.getMaterials === 'function') {
+                const mats = dms.getMaterials();
+                const uMats = (mats && mats.userGeneratedMaterials) || [];
+                if (uMats.some(m => m && m.status !== 'Success')) {
+                  return { ready: false, reason: 'user_mats_uploading' };
+                }
+              }
+            }
+          }
+          const disabled =
+            btn.disabled ||
+            btn.classList.contains('lv-btn-disabled') ||
+            btn.getAttribute('aria-disabled') === 'true';
+          if (disabled) return { ready: false, reason: 'export_btn_disabled' };
+        }
+        return { ready: true };
+      },
+      slotCount,
+      3000,
+      { ready: true }
+    );
+    if (syncState && syncState.ready) break;
+    await editorPage.waitForTimeout(500);
+  }
+
+  await unblockCapCutTemplateSyncAndPatchTransitions(editorPage).catch(() => {});
   await editorPage.keyboard.press('Escape').catch(() => {});
   return filledCount;
 }
@@ -771,6 +1238,7 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
  */
 async function openExportConfirmDialog(page) {
   for (let attempt = 1; attempt <= 45; attempt++) {
+    await unblockCapCutTemplateSyncAndPatchTransitions(page).catch(() => {});
     // Dismiss any onboarding tooltips, guide buttons, or blocking modal close icons on every attempt
     await evalSafe(
       page,
@@ -1093,6 +1561,7 @@ async function triggerExportAndSaveDownload({
   page.on('download', onDownloadListener);
 
   let downloadPromise = page.waitForEvent('download', { timeout: 240000 });
+  downloadPromise.catch(() => {});
 
   const clickConfirmBtn = async () => {
     await acquireExportSubmitGate();
@@ -1140,25 +1609,32 @@ async function triggerExportAndSaveDownload({
       );
     }
 
+    let clickedMouse = false;
     if (confirmPt) {
-      await page.mouse.click(confirmPt.x, confirmPt.y).catch(() => {});
+      clickedMouse = await page.mouse.click(confirmPt.x, confirmPt.y).then(() => true).catch(() => false);
     }
 
-    // Wait 1500ms; ONLY trigger DOM .click() if #export-confirm-button is still visible and enabled
-    await page.waitForTimeout(1500);
-    await evalSafe(page, () => {
-      const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(btn => {
-        if (!btn || btn.disabled || btn.classList.contains('lv-btn-disabled') || btn.getAttribute('aria-disabled') === 'true') {
-          return false;
+    if (!clickedMouse) {
+      await evalSafe(page, () => {
+        const btns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(btn => {
+          if (
+            !btn ||
+            btn.disabled ||
+            btn.classList.contains('lv-btn-disabled') ||
+            btn.classList.contains('lv-btn-loading') ||
+            btn.getAttribute('aria-disabled') === 'true'
+          ) {
+            return false;
+          }
+          const r = btn.getBoundingClientRect();
+          return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
+        });
+        if (btns.length > 0) {
+          btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
+          btns[0].click();
         }
-        const r = btn.getBoundingClientRect();
-        return r.width > 18 && r.height > 14 && r.left >= 0 && r.top >= 0;
       });
-      if (btns.length > 0) {
-        btns.sort((a, b) => b.getBoundingClientRect().left - a.getBoundingClientRect().left);
-        btns[0].click();
-      }
-    });
+    }
   };
 
   // Trusted click on #export-confirm-button so Chrome registers transient user activation
@@ -1193,7 +1669,11 @@ async function triggerExportAndSaveDownload({
           const hasExportProcessModal = Boolean(expProc && expProc.getBoundingClientRect().width > 100);
 
           const confirmBtns = Array.from(document.querySelectorAll('#export-confirm-button')).filter(
-            c => c.offsetParent !== null && !c.disabled && !c.classList.contains('lv-btn-disabled')
+            c =>
+              c.offsetParent !== null &&
+              !c.disabled &&
+              !c.classList.contains('lv-btn-disabled') &&
+              !c.classList.contains('lv-btn-loading')
           );
           const hasConfirm = confirmBtns.length > 0;
           const btns = Array.from(document.querySelectorAll('button')).filter(b => b.offsetParent !== null);
@@ -1216,17 +1696,17 @@ async function triggerExportAndSaveDownload({
         idleNotExportingTicks = 0;
         if (state.pctStr) onRenderPercent(state.pctStr);
       } else if (state.hasConfirm && activeDownloadEvents === 0) {
-        // Wait 2 consecutive ticks (~6s) before re-clicking #export-confirm-button so we never send duplicate export requests
+        // Wait 4 consecutive ticks (~12s) before re-clicking #export-confirm-button so we never send duplicate export requests while video_draft/save is in flight
         idleNotExportingTicks = 0;
         confirmStillVisibleTicks++;
-        if (confirmStillVisibleTicks >= 2) {
+        if (confirmStillVisibleTicks >= 4) {
           confirmStillVisibleTicks = 0;
           await clickConfirmBtn();
         }
       } else if (!state.hasManualDlBtn && !hasStartedExporting && activeDownloadEvents === 0) {
         confirmStillVisibleTicks = 0;
         idleNotExportingTicks++;
-        if (idleNotExportingTicks >= 3) {
+        if (idleNotExportingTicks >= 4) {
           idleNotExportingTicks = 0;
           const readyAgain = await openExportConfirmDialog(page);
           if (readyAgain) {
@@ -1286,6 +1766,7 @@ async function triggerExportAndSaveDownload({
         await enablePageMultiDownloads(page);
         await page.waitForTimeout(800);
         downloadPromise = page.waitForEvent('download', { timeout: 90000 });
+        downloadPromise.catch(() => {});
         const hasManualDl = await evalSafe(
           page,
           () => {
@@ -1432,6 +1913,8 @@ async function runCapCutWebAutomation({
       }
     });
 
+    await syncOriginalTemplateAudio(outPath, templateInfo);
+
     // Strict safety check: verify the MP4 file exists on disk, has valid size (>200KB), and is playable via ffprobe BEFORE deleting Cloud cache!
     const fileSize = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
     const durationSec = await probeDurationSafe(outPath);
@@ -1445,8 +1928,6 @@ async function runCapCutWebAutomation({
         templateInfo,
         inputSignature
       });
-      onProgress(98, 'Đã kiểm tra file MP4 an toàn 100%, đang dọn rác bộ nhớ đám mây CapCut Space...');
-      await cleanupCapCutCloudSpace(editorPage, onLog).catch(() => {});
     } else {
       onLog('⚠️ File tải về chưa hoàn chỉnh, hệ thống GIỮ NGUYÊN bản gốc trên Cloud CapCut để không bị mất video!');
     }
@@ -1472,7 +1953,7 @@ async function runCapCutWebAutomation({
   }
 }
 
-const GLOBAL_MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '2', 10) || 2;
+const GLOBAL_MAX_CONCURRENCY = parseInt(process.env.MAX_CONCURRENCY || '5', 10) || 5;
 let sharedBrowserContext = null;
 let sharedContextLaunchPromise = null;
 let activeBatchCount = 0;
@@ -1693,12 +2174,8 @@ async function releaseSharedBrowserContext(allVerified, onLog) {
           try { await openPages[i].close(); } catch {}
         }
       }
-      const capcutPage =
-        activeCtx.pages().find(p => !p.isClosed() && p.url().includes('capcut.com')) ||
-        activeCtx.pages()[0];
-      if (capcutPage && allVerified) {
-        await cleanupCapCutCloudSpace(capcutPage, onLog).catch(() => {});
-      }
+      // Do NOT delete workspace assets via cleanupCapCutCloudSpace while warm editor tabs are open or cached in IndexedDB,
+      // because deleting synced template assets and deduplicated user uploads causes subsequent renders to reference trashed cloud assets!
     } catch {}
   })();
 }
@@ -1710,7 +2187,7 @@ async function releaseSharedBrowserContext(allVerified, onLog) {
 async function runCapCutWebParallelBatch({
   templateInfo,
   batchFileSets = [],
-  maxConcurrency = 2,
+  maxConcurrency = 5,
   onLog = () => {},
   onProgress = () => {},
   onScreenshot = () => {},
@@ -1811,9 +2288,15 @@ async function runCapCutWebParallelBatch({
       if (controller.cancelled) return null;
       let watchdogTimer = null;
       let page = null;
+      const attemptSignal = { aborted: false };
       try {
         page = await getOrResetPage(workerTry > 1);
         if (!page || controller.cancelled) return null;
+
+        const checkAborted = () => {
+          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          if (attemptSignal.aborted) throw new Error('ATTEMPT_ABORTED');
+        };
 
         const executeAttempt = async () => {
           await hidePageWindowOffscreen(page);
@@ -1839,25 +2322,25 @@ async function runCapCutWebParallelBatch({
           } else {
             onLog(`${tag} ${workerTry > 1 ? '[Thử lại] ' : ''}Đang mở mẫu và nạp cặp file #${pairNum}: ${fileLabel}...`);
             await acquireEditorOpenGate();
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+            checkAborted();
             await page.goto(targetEditorUrl, { waitUntil: 'domcontentloaded', timeout: 50000 });
-            if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+            checkAborted();
             await page.waitForSelector('.segment-item[data-mutable-index], .segment-item input[type="file"]', { timeout: 30000 }).catch(() => {});
             await page.waitForTimeout(1200);
             page._lastUploadedFiles = null;
           }
 
-          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          checkAborted();
 
           const filledCount = await fillTemplateSlotsOnEditor(
             page,
             fileSet,
             (m) => {
-              if (!controller.cancelled) onLog(`${tag} ${m}`);
+              if (!controller.cancelled && !attemptSignal.aborted) onLog(`${tag} ${m}`);
             },
             reusedInPlace ? page._lastUploadedFiles : null
           );
-          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          checkAborted();
           if (filledCount === 0) {
             throw new Error(`${tag} Không tìm thấy các ô phân đoạn của mẫu.`);
           }
@@ -1869,10 +2352,10 @@ async function runCapCutWebParallelBatch({
           emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
 
           await page.waitForTimeout(500);
-          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          checkAborted();
 
           const exportDialogReady = await openExportConfirmDialog(page);
-          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          checkAborted();
           if (!exportDialogReady) {
             throw new Error(`${tag} Nút xuất video trên CapCut chưa sẵn sàng (có thể do 1 phân đoạn chưa tải xong).`);
           }
@@ -1890,10 +2373,10 @@ async function runCapCutWebParallelBatch({
             outPath,
             tag,
             onLog: (m) => {
-              if (!controller.cancelled) onLog(m);
+              if (!controller.cancelled && !attemptSignal.aborted) onLog(m);
             },
             onRenderPercent: (pctInfo) => {
-              if (controller.cancelled) return;
+              if (controller.cancelled || attemptSignal.aborted) return;
               const numMatch = pctInfo.match(/(\d{1,3})/);
               if (numMatch) {
                 const renderPct = Math.min(100, parseInt(numMatch[1], 10));
@@ -1902,7 +2385,9 @@ async function runCapCutWebParallelBatch({
               emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
             }
           });
-          if (controller.cancelled) throw new Error('RENDER_CANCELLED');
+          checkAborted();
+
+          await syncOriginalTemplateAudio(outPath, templateInfo);
 
           const fileSize = fs.existsSync(outPath) ? fs.statSync(outPath).size : 0;
           const inputSignature = getPairInputSignature(fileSet);
@@ -1953,6 +2438,7 @@ async function runCapCutWebParallelBatch({
           executeAttempt(),
           new Promise((_, reject) => {
             watchdogTimer = setTimeout(() => {
+              attemptSignal.aborted = true;
               reject(new Error(`${tag} Quá thời gian xử lý luồng (300s)`));
             }, 300000);
           })
@@ -1961,6 +2447,7 @@ async function runCapCutWebParallelBatch({
         if (watchdogTimer) clearTimeout(watchdogTimer);
         return results[jobIdx];
       } catch (err) {
+        attemptSignal.aborted = true;
         if (watchdogTimer) clearTimeout(watchdogTimer);
         if (controller.cancelled || (err && err.message === 'RENDER_CANCELLED')) {
           return null;
