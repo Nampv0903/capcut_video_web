@@ -523,7 +523,7 @@ function getCanonicalMediaKey(nameStr) {
   let ext = rawExt;
   if (/^\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i.test(rawExt)) {
     ext = '.jpg';
-  } else if (/^\.(mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i.test(rawExt)) {
+  } else if (/^\.(mov|mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i.test(rawExt)) {
     ext = '.mp4';
   }
   const base = (dotIdx > 0 ? stripped.slice(0, dotIdx) : stripped)

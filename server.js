@@ -393,23 +393,32 @@ function getTemplateUploadDir(templateInfo) {
 }
 
 function findUploadFileOnDisk(filename, preferredTemplate = null) {
-  const base = path.basename(filename || '');
-  if (!base) return null;
-  if (preferredTemplate) {
-    const { folderName, dir } = getTemplateUploadDir(preferredTemplate);
-    const p = path.join(dir, base);
-    if (fs.existsSync(p)) return { fullPath: p, folderName, url: `/uploads/${folderName}/${base}` };
+  const rawBase = path.basename(filename || '');
+  if (!rawBase) return null;
+  const candidateNames = [rawBase];
+  if (/\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i.test(rawBase)) {
+    candidateNames.push(rawBase.replace(/\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i, '.jpg'));
+  } else if (/\.(mov|mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i.test(rawBase)) {
+    candidateNames.push(rawBase.replace(/\.(mov|mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i, '.mp4'));
   }
-  const direct = path.join(UPLOAD_DIR, base);
-  if (fs.existsSync(direct) && fs.statSync(direct).isFile()) {
-    return { fullPath: direct, folderName: '', url: `/uploads/${base}` };
-  }
-  const entries = fs.readdirSync(UPLOAD_DIR, { withFileTypes: true });
-  for (const ent of entries) {
-    if (ent.isDirectory()) {
-      const subPath = path.join(UPLOAD_DIR, ent.name, base);
-      if (fs.existsSync(subPath)) {
-        return { fullPath: subPath, folderName: ent.name, url: `/uploads/${ent.name}/${base}` };
+
+  for (const base of candidateNames) {
+    if (preferredTemplate) {
+      const { folderName, dir } = getTemplateUploadDir(preferredTemplate);
+      const p = path.join(dir, base);
+      if (fs.existsSync(p)) return { fullPath: p, folderName, url: `/uploads/${folderName}/${base}` };
+    }
+    const direct = path.join(UPLOAD_DIR, base);
+    if (fs.existsSync(direct) && fs.statSync(direct).isFile()) {
+      return { fullPath: direct, folderName: '', url: `/uploads/${base}` };
+    }
+    const entries = fs.readdirSync(UPLOAD_DIR, { withFileTypes: true });
+    for (const ent of entries) {
+      if (ent.isDirectory()) {
+        const subPath = path.join(UPLOAD_DIR, ent.name, base);
+        if (fs.existsSync(subPath)) {
+          return { fullPath: subPath, folderName: ent.name, url: `/uploads/${ent.name}/${base}` };
+        }
       }
     }
   }
@@ -444,7 +453,7 @@ const ALLOWED_MEDIA_EXTS = new Set([
 
 const MEDIA_FILE_REGEX = /\.(mp4|mov|webm|mkv|avi|m4v|mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|jpg|jpeg|png|webp|gif|bmp|heic|heif|jfif|avif|tif|tiff)$/i;
 const CONVERT_TO_JPG_REGEX = /\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i;
-const CONVERT_TO_MP4_REGEX = /\.(mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i;
+const CONVERT_TO_MP4_REGEX = /\.(mov|mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i;
 
 let heicConvert = null;
 try {
@@ -1349,6 +1358,18 @@ app.post('/api/render', async (req, res) => {
 
       (async () => {
         try {
+          // Ensure any legacy .mov/.heic files in the snapshot sets are normalized to fast H.264 .mp4 / .jpg before feeding 5 parallel browser tabs
+          for (let pIdx = 0; pIdx < batchFileSets.length; pIdx++) {
+            for (let sIdx = 0; sIdx < batchFileSets[pIdx].length; sIdx++) {
+              const pPath = batchFileSets[pIdx][sIdx];
+              if (CONVERT_TO_JPG_REGEX.test(pPath) || CONVERT_TO_MP4_REGEX.test(pPath)) {
+                try {
+                  batchFileSets[pIdx][sIdx] = await normalizeUploadedMediaIfNeeded(pPath);
+                } catch {}
+              }
+            }
+          }
+
           const renderedOutputs = await runCapCutWebParallelBatch({
             templateInfo: template,
             batchFileSets,
