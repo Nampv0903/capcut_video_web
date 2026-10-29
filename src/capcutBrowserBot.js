@@ -353,190 +353,48 @@ function findChromeExecutable() {
 }
 
 /**
- * Opens the CapCut login window and automatically closes it ONLY after login has truly completed and the editor UI has finished loading!
+ * Opens the CapCut account window and keeps it open so the user can freely sign in, sign out, or switch accounts.
  */
 async function openCapCutLoginWindow(onLog = () => {}, onProgress = () => {}) {
   if (activeBatchCount > 0 || activeGlobalTabSlots > 0) {
     throw new Error('Hệ thống đang trong quá trình xuất video, vui lòng chờ xuất xong rồi mới mở cửa sổ Tài khoản CapCut!');
   }
-  const loginUrl = 'https://www.capcut.com/editor-template?create_id=7694831529285111061';
-  onLog('Đang mở cửa sổ đăng nhập tài khoản CapCut...');
-  onProgress(20, 'Đang mở cửa sổ đăng nhập tài khoản CapCut...');
+  const loginUrl = 'https://www.capcut.com/my-edit';
+  onLog('Đang mở cửa sổ quản lý tài khoản CapCut...');
+  onProgress(20, 'Đang mở cửa sổ quản lý tài khoản CapCut...');
 
+  if (sharedBrowserContext) {
+    try { await sharedBrowserContext.close(); } catch {}
+    sharedBrowserContext = null;
+  }
+  warmTabPoolByTemplate.clear();
+  await killProfileChromeProcesses();
+  ensureChromeProfileAllowsMultiDownloads(false);
+
+  const chromeExe = findChromeExecutable();
+  const tr = `'${chromeExe}' --user-data-dir=${PROFILE_DIR} --remote-debugging-port=${CDP_PORT} --start-maximized --new-window ${loginUrl}`;
+  await execPromise(`schtasks /Create /TN "CapCutStudioBrowser" /TR "${tr}" /SC ONCE /ST 00:00 /F`);
+  await execPromise(`schtasks /Run /TN "CapCutStudioBrowser"`);
+  for (let i = 0; i < 6; i++) {
+    await new Promise(r => setTimeout(r, 450));
+    if (await isCdpAlive()) break;
+  }
   if (!(await isCdpAlive())) {
-    if (sharedBrowserContext) {
-      try { await sharedBrowserContext.close(); } catch {}
-      sharedBrowserContext = null;
-    }
-    await killProfileChromeProcesses();
-    ensureChromeProfileAllowsMultiDownloads(false);
-    const chromeExe = findChromeExecutable();
-    const tr = `'${chromeExe}' --user-data-dir=${PROFILE_DIR} --remote-debugging-port=${CDP_PORT} --start-maximized --new-window ${loginUrl}`;
-    await execPromise(`schtasks /Create /TN "CapCutStudioBrowser" /TR "${tr}" /SC ONCE /ST 00:00 /F`);
-    await execPromise(`schtasks /Run /TN "CapCutStudioBrowser"`);
-    for (let i = 0; i < 6; i++) {
-      await new Promise(r => setTimeout(r, 450));
+    const { spawn } = require('child_process');
+    const child = spawn(
+      chromeExe,
+      [`--user-data-dir=${PROFILE_DIR}`, `--remote-debugging-port=${CDP_PORT}`, '--start-maximized', '--new-window', loginUrl],
+      { detached: true, stdio: 'ignore' }
+    );
+    child.unref();
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 500));
       if (await isCdpAlive()) break;
-    }
-    if (!(await isCdpAlive())) {
-      const { spawn } = require('child_process');
-      const child = spawn(
-        chromeExe,
-        [`--user-data-dir=${PROFILE_DIR}`, `--remote-debugging-port=${CDP_PORT}`, '--start-maximized', '--new-window', loginUrl],
-        { detached: true, stdio: 'ignore' }
-      );
-      child.unref();
-      for (let i = 0; i < 15; i++) {
-        await new Promise(r => setTimeout(r, 500));
-        if (await isCdpAlive()) break;
-      }
     }
   }
 
-  onLog('✅ Đã mở cửa sổ đăng nhập CapCut. Sau khi đăng nhập xong và trang tải hoàn tất, cửa sổ sẽ tự động đóng lại.');
-
-  // Background watcher: waits until the user completes login AND the CapCut editor finishes rendering the logged-in workspace
-  (async () => {
-    try {
-      const browser = await chromium.connectOverCDP(CDP_URL);
-      const context = browser.contexts()[0];
-      if (!context) return;
-
-      const getAuthCookies = async () => {
-        const cookies = await context.cookies('https://www.capcut.com').catch(() => []);
-        const sessionCookie = cookies.find(c => c.name === 'sessionid' && c.value && c.value.length > 8);
-        const uidCookie = cookies.find(c => (c.name === 'uid_tt' || c.name === 'sid_tt') && c.value && c.value.length > 5);
-        return {
-          sessionId: sessionCookie ? sessionCookie.value : '',
-          hasUid: Boolean(uidCookie)
-        };
-      };
-
-      // Give initial navigation 4s to start loading
-      await new Promise(r => setTimeout(r, 4000));
-
-      let consecutiveLoggedInTicks = 0;
-      let clickedSignInOnce = false;
-
-      // Poll every 500ms
-      for (let tick = 0; tick < 1200; tick++) {
-        await new Promise(r => setTimeout(r, 500));
-        if (!(await isCdpAlive())) break;
-
-        const allPages = context.pages();
-        if (allPages.length === 0) break;
-
-        // 1. Check if any OAuth popup or login redirect tab is currently open
-        const hasOAuthPopupOrLoginUrl = allPages.some(p => {
-          const u = p.url() || '';
-          return /\/login|passport|accounts\.google|tiktok\.com|facebook\.com|appleid\.apple/i.test(u);
-        });
-
-        if (hasOAuthPopupOrLoginUrl) {
-          consecutiveLoggedInTicks = 0;
-          continue;
-        }
-
-        const mainPage = allPages.find(p => p.url().includes('capcut.com') && !p.url().includes('/login')) || allPages[0];
-        if (!mainPage || !mainPage.url().includes('capcut.com')) {
-          consecutiveLoggedInTicks = 0;
-          continue;
-        }
-
-        const { sessionId, hasUid } = await getAuthCookies();
-
-        // 2. Inspect actual rendered DOM on CapCut page
-        const domState = await mainPage.evaluate(() => {
-          if (document.readyState !== 'complete') {
-            return { isEditorLoaded: false, hasUnauthUI: true, hasLoginModalOpen: false, hasWorkspaceUI: false };
-          }
-
-          const bodyText = document.body ? (document.body.innerText || '') : '';
-
-          // Check if the editor UI has actually finished mounting & rendering
-          const visibleEls = Array.from(document.querySelectorAll('button, a, div[role="button"], span')).filter(
-            el => el.offsetParent !== null
-          );
-          const hasExportBtn = visibleEls.some(el => /^(Export|Xuất)$/i.test((el.innerText || '').trim()));
-          const hasMediaCanvas = document.querySelectorAll('video, canvas').length > 0;
-          const isEditorLoaded = hasExportBtn && hasMediaCanvas;
-
-          // Detect "Welcome to CapCut" modal or passport iframe
-          const hasLoginModalText =
-            /Welcome to CapCut|Chào mừng bạn đến với CapCut|Continue with Google|Tiếp tục với Google|Continue with TikTok|Tiếp tục với TikTok|Continue with Facebook|Tiếp tục với Facebook|Continue with email|Tiếp tục với email/i.test(
-              bodyText
-            );
-          const hasLoginIframeOrModal = Boolean(
-            document.querySelector(
-              'iframe[src*="passport"], iframe[src*="login"], [class*="login-modal"], [class*="lv_sign_in"], [class*="sign-in"]'
-            )
-          );
-          const hasLoginModalOpen = hasLoginModalText || hasLoginIframeOrModal;
-
-          // Detect unauthenticated top warning banner or "Sign in" button/link
-          const hasUnauthBanner =
-            /aren't signed in|not be saved permanently|sign into your account|chưa đăng nhập|không được lưu vĩnh viễn/i.test(
-              bodyText
-            );
-          const hasSignInBtn = visibleEls.some(el =>
-            /^(Sign in|Log in|Đăng nhập|Sign up|Đăng ký)$/i.test((el.innerText || '').trim())
-          );
-
-          // Check for authenticated workspace indicators (e.g., "Phan Van Nam657's space", "Không gian của ...", "Renew" / "Gia hạn")
-          const hasWorkspaceUI = /'s space|Không gian của|Auto upload|Tải lên tự động|Renew|Gia hạn/i.test(bodyText);
-
-          return {
-            isEditorLoaded,
-            hasLoginModalOpen,
-            hasUnauthUI: hasLoginModalOpen || hasUnauthBanner || hasSignInBtn,
-            hasWorkspaceUI
-          };
-        }).catch(() => ({ isEditorLoaded: false, hasUnauthUI: true, hasLoginModalOpen: false, hasWorkspaceUI: false }));
-
-        // If editor loaded unauthenticated and the login modal isn't open yet, click "Sign in" / "Đăng nhập" once so the modal opens
-        if (domState.isEditorLoaded && !domState.hasWorkspaceUI && !domState.hasLoginModalOpen && !clickedSignInOnce) {
-          clickedSignInOnce = true;
-          await mainPage.evaluate(() => {
-            const els = Array.from(document.querySelectorAll('button, a, div[role="button"], span')).filter(
-              el => el.offsetParent !== null
-            );
-            const signInEl = els.find(el => /^(Sign in|Log in|Đăng nhập)$/i.test((el.innerText || '').trim()));
-            if (signInEl) signInEl.click();
-          }).catch(() => {});
-        }
-
-        // STRICT CHECK: Only count as logged-in when:
-        // 1. Auth cookies (sessionId & uid) exist
-        // 2. Editor UI (Export + canvas/video) is completely rendered
-        // 3. User's workspace UI ("'s space" / "Không gian của" / "Renew" / "Gia hạn") is rendered on screen
-        // 4. ZERO unauthenticated banners, Sign-in buttons, or login modals exist
-        if (
-          sessionId &&
-          hasUid &&
-          domState.isEditorLoaded &&
-          domState.hasWorkspaceUI &&
-          !domState.hasUnauthUI
-        ) {
-          consecutiveLoggedInTicks++;
-        } else {
-          consecutiveLoggedInTicks = 0;
-        }
-
-        // Wait for 3 consecutive ticks (1.5s) after the logged-in workspace finishes rendering so Chrome commits all cookies
-        if (consecutiveLoggedInTicks >= 3) {
-          onLog('🎉 Đã đăng nhập CapCut thành công và tải xong không gian làm việc! Tự động đóng cửa sổ...');
-          onProgress(100, 'Đã đăng nhập tài khoản CapCut thành công!');
-          for (const p of context.pages()) {
-            await p.close().catch(() => {});
-          }
-          await new Promise(r => setTimeout(r, 600));
-          try { await browser.close(); } catch {}
-          break;
-        }
-      }
-    } catch {}
-  })();
-
+  onLog('✅ Đã mở cửa sổ Tài khoản CapCut (giữ nguyên cửa sổ để đăng nhập / đăng xuất tùy ý).');
+  onProgress(100, 'Đã mở cửa sổ Tài khoản CapCut.');
   return { status: 'opened' };
 }
 
