@@ -632,7 +632,31 @@ const uploadTemplateVideo = multer({
 });
 
 const SAVED_TEMPLATES_FILE = path.join(__dirname, 'cache', 'saved_templates.json');
+const LOCAL_TEMPLATES_BACKUP_FILE = path.join(__dirname, 'cache', 'local_templates_backup.json');
 const DEFAULT_TEMPLATES_FILE = path.join(__dirname, 'cache', 'default_templates.json');
+const DELETED_TEMPLATES_FILE = path.join(__dirname, 'cache', 'deleted_templates.json');
+
+function loadDeletedTemplateIds() {
+  try {
+    if (fs.existsSync(DELETED_TEMPLATES_FILE)) {
+      const arr = JSON.parse(fs.readFileSync(DELETED_TEMPLATES_FILE, 'utf8'));
+      if (Array.isArray(arr)) return new Set(arr.map(String));
+    }
+  } catch {}
+  return new Set();
+}
+
+function saveDeletedTemplateIds(idSet) {
+  try {
+    fs.writeFileSync(DELETED_TEMPLATES_FILE, JSON.stringify(Array.from(idSet), null, 2), 'utf8');
+  } catch {}
+}
+
+function persistTemplatesList(list) {
+  const jsonStr = JSON.stringify(list.slice(0, 50), null, 2);
+  try { fs.writeFileSync(SAVED_TEMPLATES_FILE, jsonStr, 'utf8'); } catch {}
+  try { fs.writeFileSync(LOCAL_TEMPLATES_BACKUP_FILE, jsonStr, 'utf8'); } catch {}
+}
 
 // Clean up any old auto-generated fake template videos from cache
 for (const fakeFile of [
@@ -647,30 +671,37 @@ for (const fakeFile of [
 }
 
 function loadSavedTemplates() {
+  const deletedIds = loadDeletedTemplateIds();
   let list = [];
   let dirty = false;
-  try {
-    if (fs.existsSync(SAVED_TEMPLATES_FILE)) {
-      const raw = JSON.parse(fs.readFileSync(SAVED_TEMPLATES_FILE, 'utf8'));
-      if (Array.isArray(raw)) {
-        list = raw.filter(t => t && t.templateId && !String(t.templateId).startsWith('cc_'));
-      }
-    }
-  } catch {}
 
-  try {
-    if (fs.existsSync(DEFAULT_TEMPLATES_FILE)) {
-      const defRaw = JSON.parse(fs.readFileSync(DEFAULT_TEMPLATES_FILE, 'utf8'));
-      if (Array.isArray(defRaw)) {
-        for (const dt of defRaw) {
-          if (dt && dt.templateId && !list.some(t => String(t.templateId) === String(dt.templateId))) {
-            list.push(dt);
-            dirty = true;
+  for (const srcFile of [SAVED_TEMPLATES_FILE, LOCAL_TEMPLATES_BACKUP_FILE, DEFAULT_TEMPLATES_FILE]) {
+    try {
+      if (!fs.existsSync(srcFile)) continue;
+      const raw = JSON.parse(fs.readFileSync(srcFile, 'utf8'));
+      if (!Array.isArray(raw)) continue;
+      for (const item of raw) {
+        if (!item || !item.templateId || String(item.templateId).startsWith('cc_')) continue;
+        const tid = String(item.templateId);
+        if (deletedIds.has(tid)) continue;
+        const existing = list.find(t => String(t.templateId) === tid);
+        if (!existing) {
+          list.push(item);
+          if (srcFile !== SAVED_TEMPLATES_FILE) dirty = true;
+        } else if (item.clientSlots && typeof item.clientSlots === 'object') {
+          if (!existing.clientSlots || typeof existing.clientSlots !== 'object') {
+            existing.clientSlots = {};
+          }
+          for (const [cid, cSlots] of Object.entries(item.clientSlots)) {
+            if (!existing.clientSlots[cid] && Array.isArray(cSlots) && cSlots.length > 0) {
+              existing.clientSlots[cid] = cSlots;
+              dirty = true;
+            }
           }
         }
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   // Auto-recover any templates whose upload/output folder (<SLUG>_<templateId>) exists on disk after a git pull/reset
   try {
@@ -682,14 +713,26 @@ function loadSavedTemplates() {
         if (!m) continue;
         const slug = m[1];
         const tplId = m[2];
+        if (deletedIds.has(tplId)) continue;
         if (!list.some(t => String(t.templateId) === tplId)) {
+          let recoveredTitle = slug.replace(/-/g, ' ');
+          try {
+            const outStatePath = path.join(OUTPUT_DIR, ent.name, 'outputs_state.json');
+            if (fs.existsSync(outStatePath)) {
+              const outMap = JSON.parse(fs.readFileSync(outStatePath, 'utf8')) || {};
+              const firstEntry = Object.values(outMap).find(e => e && e.templateTitle);
+              if (firstEntry && firstEntry.templateTitle) {
+                recoveredTitle = firstEntry.templateTitle;
+              }
+            }
+          } catch {}
           const localVid = path.join(CACHE_DIR, `template_${tplId}.mp4`);
           list.unshift({
             templateId: tplId,
             originalUrl: `https://www.capcut.com/template-detail/${tplId}`,
             finalUrl: `https://www.capcut.com/template-detail/${tplId}`,
             editorUrl: `https://www.capcut.com/editor-template?create_id=${tplId}&enter_from=main_btn&from_page=towards_page_template_reflux`,
-            title: slug.replace(/-/g, ' '),
+            title: recoveredTitle,
             localVideoUrl: fs.existsSync(localVid) ? `/cache/templates/template_${tplId}.mp4` : '',
             canUseOnWeb: true,
             totalDuration: 20,
@@ -708,16 +751,19 @@ function loadSavedTemplates() {
     }
   } catch {}
 
-  if (dirty) {
-    try {
-      fs.writeFileSync(SAVED_TEMPLATES_FILE, JSON.stringify(list, null, 2), 'utf8');
-    } catch {}
+  if (dirty || !fs.existsSync(LOCAL_TEMPLATES_BACKUP_FILE)) {
+    persistTemplatesList(list);
   }
   return list;
 }
 
 function saveAnalyzedTemplate(tpl) {
   try {
+    const deletedIds = loadDeletedTemplateIds();
+    if (tpl && tpl.templateId && deletedIds.has(String(tpl.templateId))) {
+      deletedIds.delete(String(tpl.templateId));
+      saveDeletedTemplateIds(deletedIds);
+    }
     const allExisting = loadSavedTemplates();
     const prev = allExisting.find(t => String(t.templateId) === String(tpl.templateId));
     if (prev && Array.isArray(prev.slots) && Array.isArray(tpl.slots)) {
@@ -731,9 +777,12 @@ function saveAnalyzedTemplate(tpl) {
         };
       });
     }
+    if (prev && prev.clientSlots && !tpl.clientSlots) {
+      tpl.clientSlots = prev.clientSlots;
+    }
     const list = allExisting.filter(t => String(t.templateId) !== String(tpl.templateId));
     list.unshift(tpl);
-    fs.writeFileSync(SAVED_TEMPLATES_FILE, JSON.stringify(list.slice(0, 30), null, 2), 'utf8');
+    persistTemplatesList(list);
   } catch {}
 }
 
@@ -815,7 +864,7 @@ app.put('/api/templates/:templateId/slots', (req, res) => {
       target.clientSlots[clientId] = normalizedSlots;
       target.slots = normalizedSlots;
       target.slotCount = normalizedSlots.length;
-      fs.writeFileSync(SAVED_TEMPLATES_FILE, JSON.stringify(list, null, 2), 'utf8');
+      persistTemplatesList(list);
     }
     res.json({ success: true, template: target || null });
   } catch (err) {
@@ -826,8 +875,11 @@ app.put('/api/templates/:templateId/slots', (req, res) => {
 app.delete('/api/templates/:templateId', (req, res) => {
   try {
     const { templateId } = req.params;
+    const deletedIds = loadDeletedTemplateIds();
+    deletedIds.add(String(templateId));
+    saveDeletedTemplateIds(deletedIds);
     const list = loadSavedTemplates().filter(t => String(t.templateId) !== String(templateId));
-    fs.writeFileSync(SAVED_TEMPLATES_FILE, JSON.stringify(list, null, 2), 'utf8');
+    persistTemplatesList(list);
     res.json({ success: true, templates: list });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -1179,7 +1231,7 @@ app.delete('/api/uploads/:filename', (req, res) => {
               s.assignedFilename = '';
             });
           }
-          fs.writeFileSync(SAVED_TEMPLATES_FILE, JSON.stringify(templates, null, 2), 'utf8');
+          persistTemplatesList(templates);
 
           const { dir: tplUploadDir } = getTemplateUploadDir(tpl);
           if (fs.existsSync(tplUploadDir)) {
