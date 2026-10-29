@@ -6,6 +6,7 @@ cache/render_jobs/
 cache/temp/
 cache/uploads_meta.json
 cache/outputs_state.json
+cache/saved_templates.json
 **/.auth_secret
 cache/debug_*.png
 .agent/

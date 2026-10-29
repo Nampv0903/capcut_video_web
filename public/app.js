@@ -673,7 +673,16 @@ function renderSlotsTimeline() {
     if (!Array.isArray(slot.assignedFiles)) {
       slot.assignedFiles = [];
     }
-    slot.assignedFiles = slot.assignedFiles.filter(fname => userClips.some(c => c.filename === fname));
+    slot.assignedFiles = slot.assignedFiles
+      .map(fname => {
+        if (userClips.some(c => c.filename === fname)) return fname;
+        const baseNoExt = String(fname || '').replace(/\.[^.]+$/, '');
+        const convertedMatch = baseNoExt
+          ? userClips.find(c => String(c.filename || '').replace(/\.[^.]+$/, '') === baseNoExt)
+          : null;
+        return convertedMatch ? convertedMatch.filename : null;
+      })
+      .filter(Boolean);
 
     const box = document.createElement('div');
     box.className = `slot-box slot-theme-${idx % 4}`;

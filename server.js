@@ -632,6 +632,7 @@ const uploadTemplateVideo = multer({
 });
 
 const SAVED_TEMPLATES_FILE = path.join(__dirname, 'cache', 'saved_templates.json');
+const DEFAULT_TEMPLATES_FILE = path.join(__dirname, 'cache', 'default_templates.json');
 
 // Clean up any old auto-generated fake template videos from cache
 for (const fakeFile of [
@@ -646,15 +647,73 @@ for (const fakeFile of [
 }
 
 function loadSavedTemplates() {
+  let list = [];
+  let dirty = false;
   try {
     if (fs.existsSync(SAVED_TEMPLATES_FILE)) {
       const raw = JSON.parse(fs.readFileSync(SAVED_TEMPLATES_FILE, 'utf8'));
       if (Array.isArray(raw)) {
-        return raw.filter(t => t && t.templateId && !String(t.templateId).startsWith('cc_'));
+        list = raw.filter(t => t && t.templateId && !String(t.templateId).startsWith('cc_'));
       }
     }
   } catch {}
-  return [];
+
+  try {
+    if (fs.existsSync(DEFAULT_TEMPLATES_FILE)) {
+      const defRaw = JSON.parse(fs.readFileSync(DEFAULT_TEMPLATES_FILE, 'utf8'));
+      if (Array.isArray(defRaw)) {
+        for (const dt of defRaw) {
+          if (dt && dt.templateId && !list.some(t => String(t.templateId) === String(dt.templateId))) {
+            list.push(dt);
+            dirty = true;
+          }
+        }
+      }
+    }
+  } catch {}
+
+  // Auto-recover any templates whose upload/output folder (<SLUG>_<templateId>) exists on disk after a git pull/reset
+  try {
+    for (const rootDir of [UPLOAD_DIR, OUTPUT_DIR]) {
+      if (!fs.existsSync(rootDir)) continue;
+      for (const ent of fs.readdirSync(rootDir, { withFileTypes: true })) {
+        if (!ent.isDirectory()) continue;
+        const m = ent.name.match(/^(.+)_(\d{10,})$/);
+        if (!m) continue;
+        const slug = m[1];
+        const tplId = m[2];
+        if (!list.some(t => String(t.templateId) === tplId)) {
+          const localVid = path.join(CACHE_DIR, `template_${tplId}.mp4`);
+          list.unshift({
+            templateId: tplId,
+            originalUrl: `https://www.capcut.com/template-detail/${tplId}`,
+            finalUrl: `https://www.capcut.com/template-detail/${tplId}`,
+            editorUrl: `https://www.capcut.com/editor-template?create_id=${tplId}&enter_from=main_btn&from_page=towards_page_template_reflux`,
+            title: slug.replace(/-/g, ' '),
+            localVideoUrl: fs.existsSync(localVid) ? `/cache/templates/template_${tplId}.mp4` : '',
+            canUseOnWeb: true,
+            totalDuration: 20,
+            width: 720,
+            height: 1280,
+            slotCount: 2,
+            slots: [
+              { index: 1, startTime: 0, endTime: 10, duration: 10, assignedFiles: [], assignedFilename: '' },
+              { index: 2, startTime: 10, endTime: 20, duration: 10, assignedFiles: [], assignedFilename: '' }
+            ],
+            clientSlots: {}
+          });
+          dirty = true;
+        }
+      }
+    }
+  } catch {}
+
+  if (dirty) {
+    try {
+      fs.writeFileSync(SAVED_TEMPLATES_FILE, JSON.stringify(list, null, 2), 'utf8');
+    } catch {}
+  }
+  return list;
 }
 
 function saveAnalyzedTemplate(tpl) {
@@ -696,6 +755,26 @@ app.get('/api/templates/builtin', async (req, res) => {
       } else if (clientId !== 'default' && Array.isArray(tpl.slots)) {
         // Fresh client starts with clean empty slots if another client already had files in the global fallback
         copy.slots = tpl.slots.map(s => ({ ...s, assignedFiles: [], assignedFilename: '' }));
+      }
+      // If all slots are empty (e.g. after git pull reset saved_templates.json) but this template's upload folder on disk has files, auto-restore them!
+      if (Array.isArray(copy.slots) && copy.slots.length === 2 && copy.slots.every(s => !s.assignedFiles || s.assignedFiles.length === 0)) {
+        try {
+          const { dir } = getTemplateUploadDir(copy);
+          if (fs.existsSync(dir)) {
+            const diskFiles = fs.readdirSync(dir)
+              .filter(f => MEDIA_FILE_REGEX.test(f))
+              .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+            const imgRegex = /\.(jpg|jpeg|png|webp|gif|bmp|heic|heif|jfif|avif|tif|tiff)$/i;
+            const vids = diskFiles.filter(f => !imgRegex.test(f));
+            const imgs = diskFiles.filter(f => imgRegex.test(f));
+            if (vids.length > 0 && imgs.length > 0) {
+              copy.slots = [
+                { ...copy.slots[0], assignedFiles: vids, assignedFilename: vids[0] || '' },
+                { ...copy.slots[1], assignedFiles: imgs, assignedFilename: imgs[0] || '' }
+              ];
+            }
+          }
+        } catch {}
       }
       return copy;
     });
