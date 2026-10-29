@@ -367,7 +367,6 @@ async function openCapCutLoginWindow(onLog = () => {}, onProgress = () => {}) {
     try { await sharedBrowserContext.close(); } catch {}
     sharedBrowserContext = null;
   }
-  warmTabPoolByTemplate.clear();
   await killProfileChromeProcesses();
   ensureChromeProfileAllowsMultiDownloads(false);
 
