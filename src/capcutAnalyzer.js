@@ -84,7 +84,7 @@ function downloadFile(url, destPath, redirectDepth = 0) {
  */
 function probeVideo(filePath) {
   return new Promise((resolve) => {
-    const isImage = /\.(jpg|jpeg|png|webp|bmp|gif)$/i.test(filePath);
+    const isImage = /\.(jpg|jpeg|png|webp|bmp|gif|heic|heif|jfif|avif|tif|tiff)$/i.test(filePath);
     execFile('ffprobe', [
       '-v', 'error',
       '-select_streams', 'v:0',

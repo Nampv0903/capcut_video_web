@@ -30,7 +30,7 @@ async function stabilizeVideoFile(filePath, level = 'recommended', onLog = () =>
     return filePath;
   }
   const ext = path.extname(filePath).toLowerCase();
-  if (['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'].includes(ext)) {
+  if (['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.heic', '.heif', '.jfif', '.avif', '.tif', '.tiff'].includes(ext)) {
     return filePath; // Static images don't need stabilization
   }
 

@@ -437,8 +437,110 @@ function findOutputFileOnDisk(filename) {
 
 const ALLOWED_MEDIA_EXTS = new Set([
   '.mp4', '.mov', '.webm', '.mkv', '.avi',
-  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'
+  '.m4v', '.mts', '.m2ts', '.ts', '.wmv', '.flv', '.f4v', '.3gp', '.3g2', '.mpg', '.mpeg', '.vob', '.ogv', '.asf',
+  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp',
+  '.heic', '.heif', '.jfif', '.avif', '.tif', '.tiff'
 ]);
+
+const MEDIA_FILE_REGEX = /\.(mp4|mov|webm|mkv|avi|m4v|mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|jpg|jpeg|png|webp|gif|bmp|heic|heif|jfif|avif|tif|tiff)$/i;
+const CONVERT_TO_JPG_REGEX = /\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i;
+const CONVERT_TO_MP4_REGEX = /\.(mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i;
+
+const heicConvert = require('heic-convert');
+
+async function normalizeUploadedMediaIfNeeded(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) {
+    return filePath;
+  }
+
+  // 1. Auto-convert exotic image formats (.heic, .heif, .jfif, .avif, .tif, .tiff, .bmp) -> standard .jpg
+  if (CONVERT_TO_JPG_REGEX.test(filePath)) {
+    const jpgPath = filePath.replace(CONVERT_TO_JPG_REGEX, '.jpg');
+    const isHeic = /\.(heic|heif)$/i.test(filePath);
+    let converted = false;
+
+    if (isHeic) {
+      try {
+        const inputBuffer = await fs.promises.readFile(filePath);
+        const outputBuffer = await heicConvert({
+          buffer: inputBuffer,
+          format: 'JPEG',
+          quality: 0.92
+        });
+        await fs.promises.writeFile(jpgPath, Buffer.from(outputBuffer));
+        converted = true;
+      } catch {}
+    }
+
+    if (!converted) {
+      try {
+        await new Promise((resolve, reject) => {
+          const { execFile } = require('child_process');
+          execFile(
+            'ffmpeg',
+            ['-y', '-i', filePath, '-frames:v', '1', '-q:v', '2', jpgPath],
+            { maxBuffer: 25 * 1024 * 1024 },
+            (err) => (err ? reject(err) : resolve())
+          );
+        });
+        converted = true;
+      } catch {
+        if (/\.jfif$/i.test(filePath)) {
+          fs.copyFileSync(filePath, jpgPath);
+          converted = true;
+        }
+      }
+    }
+
+    if (converted && fs.existsSync(jpgPath) && fs.statSync(jpgPath).size > 0) {
+      try {
+        if (jpgPath !== filePath && fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      } catch {}
+      return jpgPath;
+    }
+    throw new Error(`Không thể chuyển đổi định dạng ảnh "${path.extname(filePath)}" sang JPG.`);
+  }
+
+  // 2. Auto-convert exotic video containers (.mts, .m2ts, .ts, .wmv, .flv, .3gp, .mpg, .avi, .mkv, .m4v, ...) -> standard H.264 .mp4
+  if (CONVERT_TO_MP4_REGEX.test(filePath)) {
+    const mp4Path = filePath.replace(CONVERT_TO_MP4_REGEX, '.mp4');
+    await new Promise((resolve, reject) => {
+      const { execFile } = require('child_process');
+      execFile(
+        'ffmpeg',
+        [
+          '-y',
+          '-i', filePath,
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-crf', '18',
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac',
+          '-movflags', '+faststart',
+          mp4Path
+        ],
+        { maxBuffer: 25 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (err) return reject(new Error(stderr ? stderr.slice(-300) : err.message));
+          resolve();
+        }
+      );
+    });
+    if (fs.existsSync(mp4Path) && fs.statSync(mp4Path).size > 0) {
+      try {
+        if (mp4Path !== filePath && fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath);
+        }
+      } catch {}
+      return mp4Path;
+    }
+    throw new Error(`Không thể chuyển đổi định dạng video "${path.extname(filePath)}" sang MP4.`);
+  }
+
+  return filePath;
+}
 
 function mediaFileFilter(req, file, cb) {
   const ext = (path.extname(file.originalname || '') || '').toLowerCase();
@@ -697,6 +799,14 @@ app.post('/api/uploads', upload.array('videos', 50), async (req, res) => {
     const files = req.files || [];
     const results = [];
     for (const f of files) {
+      if (CONVERT_TO_JPG_REGEX.test(f.path) || CONVERT_TO_MP4_REGEX.test(f.path)) {
+        const convertedPath = await normalizeUploadedMediaIfNeeded(f.path);
+        f.path = convertedPath;
+        f.filename = path.basename(convertedPath);
+        try {
+          f.size = fs.statSync(convertedPath).size;
+        } catch {}
+      }
       const info = await probeVideo(f.path);
       const relDir = path.relative(UPLOAD_DIR, path.dirname(f.path)).replace(/\\/g, '/');
       const urlPath = relDir ? `/uploads/${relDir}/${f.filename}` : `/uploads/${f.filename}`;
@@ -736,22 +846,38 @@ app.get('/api/uploads', async (req, res) => {
     const fileItems = [];
     const entries = fs.readdirSync(UPLOAD_DIR, { withFileTypes: true });
     for (const ent of entries) {
-      if (ent.isFile() && /\.(mp4|mov|webm|mkv|avi|jpg|jpeg|png|webp|gif|bmp)$/i.test(ent.name)) {
+      if (ent.isFile() && MEDIA_FILE_REGEX.test(ent.name)) {
+        let fullP = path.join(UPLOAD_DIR, ent.name);
+        let fName = ent.name;
+        if (CONVERT_TO_JPG_REGEX.test(fName) || CONVERT_TO_MP4_REGEX.test(fName)) {
+          try {
+            fullP = await normalizeUploadedMediaIfNeeded(fullP);
+            fName = path.basename(fullP);
+          } catch {}
+        }
         fileItems.push({
-          filename: ent.name,
+          filename: fName,
           folderName: '',
-          filePath: path.join(UPLOAD_DIR, ent.name),
-          url: `/uploads/${ent.name}`
+          filePath: fullP,
+          url: `/uploads/${fName}`
         });
       } else if (ent.isDirectory()) {
         const subDir = path.join(UPLOAD_DIR, ent.name);
-        const subFiles = fs.readdirSync(subDir).filter(f => /\.(mp4|mov|webm|mkv|avi|jpg|jpeg|png|webp|gif|bmp)$/i.test(f));
+        const subFiles = fs.readdirSync(subDir).filter(f => MEDIA_FILE_REGEX.test(f));
         for (const sf of subFiles) {
+          let fullP = path.join(subDir, sf);
+          let fName = sf;
+          if (CONVERT_TO_JPG_REGEX.test(fName) || CONVERT_TO_MP4_REGEX.test(fName)) {
+            try {
+              fullP = await normalizeUploadedMediaIfNeeded(fullP);
+              fName = path.basename(fullP);
+            } catch {}
+          }
           fileItems.push({
-            filename: sf,
+            filename: fName,
             folderName: ent.name,
-            filePath: path.join(subDir, sf),
-            url: `/uploads/${ent.name}/${sf}`
+            filePath: fullP,
+            url: `/uploads/${ent.name}/${fName}`
           });
         }
       }

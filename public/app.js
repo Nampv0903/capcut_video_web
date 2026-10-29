@@ -519,7 +519,13 @@ function getCanonicalMediaKey(nameStr) {
   const raw = String(nameStr || '').split(/[\\/]/).pop().trim();
   const stripped = raw.replace(/^p\d+_s\d+_/i, '').replace(/^(?:trim_\d+_)?(?:\d+_\d+_)?/i, '');
   const dotIdx = stripped.lastIndexOf('.');
-  const ext = dotIdx > 0 ? stripped.slice(dotIdx).toLowerCase() : '';
+  const rawExt = dotIdx > 0 ? stripped.slice(dotIdx).toLowerCase() : '';
+  let ext = rawExt;
+  if (/^\.(heic|heif|jfif|avif|tif|tiff|bmp)$/i.test(rawExt)) {
+    ext = '.jpg';
+  } else if (/^\.(mts|m2ts|ts|wmv|flv|f4v|3gp|3g2|mpg|mpeg|vob|ogv|asf|avi|mkv|m4v)$/i.test(rawExt)) {
+    ext = '.mp4';
+  }
   const base = (dotIdx > 0 ? stripped.slice(0, dotIdx) : stripped)
     .replace(/[^a-zA-Z0-9_-]/g, '_')
     .slice(0, 40)
@@ -676,7 +682,7 @@ function renderSlotsTimeline() {
       ? `<div class="slot-queue-list">
           ${slot.assignedFiles.map((fname, qIdx) => {
             const clipObj = userClips.find(c => c.filename === fname);
-            const isImg = clipObj && (Boolean(clipObj.isImage) || /\.(jpg|jpeg|png|webp|bmp|gif)$/i.test(clipObj.filename));
+            const isImg = clipObj && (Boolean(clipObj.isImage) || /\.(jpg|jpeg|png|webp|bmp|gif|heic|heif|jfif|avif|tif|tiff)$/i.test(clipObj.filename));
             const thumbHtml = clipObj
               ? (isImg
                   ? `<img class="slot-thumb" src="${clipObj.url}" alt="" draggable="false" />`
@@ -724,7 +730,7 @@ function renderSlotsTimeline() {
 
       ${queueHtml}
 
-      <input type="file" class="slot-direct-file" accept=".mp4,.mov,.webm,.mkv,.avi,.jpg,.jpeg,.png,.webp,.gif,video/*,image/*" multiple style="display:none;" />
+      <input type="file" class="slot-direct-file" accept=".mp4,.mov,.webm,.mkv,.avi,.m4v,.mts,.m2ts,.ts,.wmv,.flv,.f4v,.3gp,.3g2,.mpg,.mpeg,.vob,.ogv,.asf,.jpg,.jpeg,.png,.webp,.gif,.bmp,.heic,.heif,.jfif,.avif,.tif,.tiff,image/heic,image/heif,image/avif,image/tiff,video/*,image/*" multiple style="display:none;" />
       <div class="slot-box-footer">
         <button type="button" class="btn slot-upload-btn" style="flex:1;">
           ${SVG_UPLOAD}
@@ -817,7 +823,7 @@ function renderSlotsTimeline() {
         const fname = activeTemplate.slots[idx].assignedFiles[qIdx];
         const clipObj = userClips.find(c => c.filename === fname);
         if (!clipObj) return;
-        const isImg = Boolean(clipObj.isImage) || /\.(jpg|jpeg|png|webp|bmp|gif)$/i.test(clipObj.filename);
+        const isImg = Boolean(clipObj.isImage) || /\.(jpg|jpeg|png|webp|bmp|gif|heic|heif|jfif|avif|tif|tiff)$/i.test(clipObj.filename);
         if (isImg) {
           openImagePreviewModal(idx, qIdx, clipObj);
         } else {
