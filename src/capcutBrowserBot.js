@@ -393,7 +393,7 @@ async function openCapCutLoginWindow(onLog = () => {}, onProgress = () => {}) {
     }
   }
 
-  onLog('✅ Đã mở cửa sổ đăng nhập CapCut! Ngay khi đại ca đăng nhập xong và trang tải hoàn tất, cửa sổ sẽ tự động đóng lại.');
+  onLog('✅ Đã mở cửa sổ đăng nhập CapCut. Sau khi đăng nhập xong và trang tải hoàn tất, cửa sổ sẽ tự động đóng lại.');
 
   // Background watcher: waits until the user completes login AND the CapCut editor finishes rendering the logged-in workspace
   (async () => {
@@ -877,7 +877,8 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     await editorPage.waitForTimeout(500);
   }
 
-  onLog(`Đang tự động nhét ${videoFilePaths.length} file của đại ca vào ${slotCount} phân đoạn của mẫu (chạy ngầm 100%)...`);
+  const cleanDisplayName = (fp) =>
+    path.basename(String(fp || '')).replace(/^p\d+_s\d+_/, '').replace(/^\d+_\d+_/, '');
 
   // Record the current active thumbnail URL (img.tier-sprite-img / first img) of EVERY slot before we touch anything
   const originalSlotImgs = await evalSafe(
@@ -954,7 +955,7 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
 
     for (let retry = 1; retry <= 4; retry++) {
       if (retry > 1) {
-        onLog(`🔄 Ô #${i + 1}/${slotCount} đang đồng bộ, tự động nạp lại lần ${retry}: ${path.basename(fileToUse)}...`);
+        onLog(`🔄 Phân đoạn ${i + 1}/${slotCount} đang đồng bộ, tự động nạp lại (lần ${retry}): ${cleanDisplayName(fileToUse)}`);
         await editorPage.keyboard.press('Escape').catch(() => {});
         await editorPage.waitForTimeout(600);
       }
@@ -1072,9 +1073,9 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     const ok = await replaceSingleSlotVerified(i, fileToUse);
     if (ok) {
       filledCount++;
-      onLog(`✅ Đã tự nạp & xác nhận thay thế Ô #${i + 1}/${slotCount} -> ${path.basename(fileToUse)}`);
+      onLog(`✓ Phân đoạn ${i + 1}/${slotCount}: ${cleanDisplayName(fileToUse)}`);
     } else {
-      onLog(`⚠️ Ô #${i + 1}/${slotCount} phản hồi chậm, sẽ kiểm tra khóa lại ngay sau đây...`);
+      onLog(`⚠️ Phân đoạn ${i + 1}/${slotCount} phản hồi chậm, đang kiểm tra lại...`);
     }
     // Short settle delay (650ms) since replaceSingleSlotVerified already confirmed replacement
     await editorPage.waitForTimeout(650);
@@ -1130,7 +1131,7 @@ async function fillTemplateSlotsOnEditor(editorPage, videoFilePaths, onLog = () 
     );
 
     if (needsRefill) {
-      onLog(`🛡️ Phát hiện Ô #${i + 1}/${slotCount} chưa cập nhật ảnh mới, đang cưỡng chế nạp lại: ${path.basename(fileToUse)}...`);
+      onLog(`🔄 Nạp lại Phân đoạn ${i + 1}/${slotCount}: ${cleanDisplayName(fileToUse)}...`);
       const retryOk = await replaceSingleSlotVerified(i, fileToUse);
       if (retryOk) filledCount++;
       await editorPage.waitForTimeout(650);
@@ -1833,7 +1834,7 @@ async function runCapCutWebAutomation({
     targetEditorUrl = templateInfo.editorUrl;
   }
 
-  onLog('🤖 Đang khởi chạy Engine CapCut Ngầm (100% chạy ẩn, không bật cửa sổ làm phiền đại ca)...');
+  onLog('🤖 Đang khởi chạy trình dựng mẫu CapCut ngầm...');
   onProgress(15, 'Đang tải mẫu CapCut ngầm...');
 
   const context = await chromium.launchPersistentContext(PROFILE_DIR, {
@@ -2229,10 +2230,12 @@ async function runCapCutWebParallelBatch({
       }
     }
   } catch {}
+  const tplTitleDisplay = String((templateInfo && templateInfo.title) || (templateInfo && templateInfo.templateId) || 'CapCut').trim();
   if (existingCountAtStart > 0) {
-    onLog(`Đang tạo lại và ghi đè ${existingCountAtStart} video cũ...`);
+    onLog(`🚀 Bắt đầu tạo ${totalJobs} video (ghi đè ${existingCountAtStart} video cũ) — Mẫu "${tplTitleDisplay}" (${concurrency} luồng song song)`);
+  } else {
+    onLog(`🚀 Bắt đầu tạo ${totalJobs} video — Mẫu "${tplTitleDisplay}" (${concurrency} luồng song song)`);
   }
-  onLog(`Đang chạy ${totalJobs} luồng ghép video (Cặp #1 -> #${totalJobs})...`);
   onProgress(12, `Đang tạo ${totalJobs} video...`);
 
   await acquireSharedBrowserContext();
@@ -2279,7 +2282,7 @@ async function runCapCutWebParallelBatch({
     if (controller.cancelled) return null;
     const pairNum = jobIdx + 1;
     const fileSet = batchFileSets[jobIdx];
-    const tag = `[Luồng #${pairNum}/${totalJobs}]`;
+    const tag = `[Video #${pairNum}/${totalJobs}]`;
     const fileLabel = fileSet
       .map(f => path.basename(f).replace(/^p\d+_s\d+_/, '').replace(/^\d+_\d+_/, ''))
       .join(' + ');
@@ -2317,10 +2320,10 @@ async function runCapCutWebParallelBatch({
           }
 
           if (reusedInPlace) {
-            onLog(`${tag} ♻️ Thay trực tiếp cặp file #${pairNum} ngay trên tab CapCut đang mở (${fileLabel}) và xuất tiếp luôn...`);
+            onLog(`${tag} ♻️ Thay nguyên liệu mới trên tab sẵn có: ${fileLabel}`);
             await page.waitForTimeout(350);
           } else {
-            onLog(`${tag} ${workerTry > 1 ? '[Thử lại] ' : ''}Đang mở mẫu và nạp cặp file #${pairNum}: ${fileLabel}...`);
+            onLog(`${tag} ${workerTry > 1 ? '[Thử lại] ' : ''}Đang mở mẫu & nạp nguyên liệu: ${fileLabel}`);
             await acquireEditorOpenGate();
             checkAborted();
             await page.goto(targetEditorUrl, { waitUntil: 'domcontentloaded', timeout: 50000 });
@@ -2362,7 +2365,7 @@ async function runCapCutWebParallelBatch({
 
           jobProgress[jobIdx] = Math.max(jobProgress[jobIdx], 30);
           emitMonotonicProgress(`Đang tạo ${totalJobs} video (Đã xong ${completedCount}/${totalJobs})...`);
-          onLog(`${tag} Đang kết xuất (Render) MP4...`);
+          onLog(`${tag} ⏳ Đang kết xuất (Render) MP4...`);
 
           const { folderName, dir: tplOutDir } = getTemplateOutputDir(templateInfo);
           const outFilename = buildOutputVideoFilename(pairNum, templateInfo, batchTimeTag);
@@ -2421,9 +2424,9 @@ async function runCapCutWebParallelBatch({
 
           emitMonotonicProgress(`Đã tạo xong ${completedCount}/${totalJobs} video (${outFilename})`);
           if (overwrittenList.length > 0) {
-            onLog(`${tag} Đã ghi đè Video #${pairNum}: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+            onLog(`${tag} ✅ Hoàn tất (ghi đè): ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
           } else {
-            onLog(`${tag} Đã tạo xong Video #${pairNum}: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
+            onLog(`${tag} ✅ Hoàn tất: ${outFilename} (${(fileSize / 1024 / 1024).toFixed(1)} MB)`);
           }
           try { onVideoReady(outItem); } catch {}
 

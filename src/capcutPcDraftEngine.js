@@ -400,7 +400,7 @@ async function injectMediaIntoCapCutDraft({
     throw new Error('Đường dẫn thư mục nháp không nằm trong vùng cho phép của CapCut PC!');
   }
   if (!userFilePaths || userFilePaths.length === 0) {
-    throw new Error('Đại ca chưa chọn video hoặc ảnh để tráo vào Project CapCut PC!');
+    throw new Error('Vui lòng chọn video hoặc ảnh để tráo vào Project CapCut PC!');
   }
 
   onLog(`Đang đọc cấu trúc Project CapCut PC tại: ${folderPath}`);
@@ -517,7 +517,7 @@ async function injectMediaIntoCapCutDraft({
   // 5. Optionally launch CapCut PC so the user can export in 1 click (or trigger Ctrl+E)
   const env = detectCapCutPcEnvironment();
   if (autoLaunchCapCut && env.exePath) {
-    onLog(`Đang mở CapCut PC (${env.exePath}) để đại ca xuất video với đầy đủ hiệu ứng gốc...`);
+    onLog(`Đang mở CapCut PC (${env.exePath}) để xuất video với đầy đủ hiệu ứng gốc...`);
     const child = spawn(env.exePath, [], { detached: true, stdio: 'ignore' });
     child.unref();
   }

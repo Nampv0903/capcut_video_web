@@ -124,7 +124,7 @@ async function renderWithFfmpegEngine({
   onProgress = () => {}
 }) {
   if (!videoFilePaths || videoFilePaths.length === 0) {
-    throw new Error('Đại ca chưa chọn video nào để ghép vào mẫu!');
+    throw new Error('Vui lòng chọn video hoặc ảnh nguyên liệu để ghép vào mẫu!');
   }
 
   const slots = (templateInfo && Array.isArray(templateInfo.slots) && templateInfo.slots.length > 0)

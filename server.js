@@ -380,7 +380,8 @@ function broadcast(type, payload) {
 }
 
 function logToClient(message, level = 'info') {
-  console.log(`[${level.toUpperCase()}] ${message}`);
+  const timeStr = new Date().toLocaleTimeString('vi-VN', { hour12: false });
+  console.log(`[${timeStr}] ${message}`);
   broadcast('log', { message, level });
 }
 
@@ -722,7 +723,7 @@ app.post('/api/uploads', upload.array('videos', 50), async (req, res) => {
       results.push(item);
     }
     saveUploadsMeta();
-    logToClient(`Đã tải lên ${results.length} file (video/ảnh) nguyên liệu của đại ca!`, 'success');
+    logToClient(`Đã tải lên ${results.length} file nguyên liệu.`, 'success');
     res.json({ success: true, clips: results });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -884,7 +885,7 @@ app.post('/api/uploads/trim', async (req, res) => {
 // 7. Generate 6 demo clips for instant testing
 app.post('/api/uploads/generate-demo', async (req, res) => {
   try {
-    logToClient('Đang tạo 6 video demo 9:16 màu Neon để đại ca test ghép mẫu ngay...', 'info');
+    logToClient('Đang tạo 6 video nguyên liệu demo 9:16...', 'info');
     const clips = await generateDemoUserClips();
     logToClient('Đã tạo xong 6 video nguyên liệu demo!', 'success');
     res.json({ success: true, clips });
@@ -1179,7 +1180,6 @@ app.post('/api/render', async (req, res) => {
       const canRunOnWebBot = isRealCapCutWebUrl || hasValidTemplateId;
 
       const tplIdStr = String(template.templateId || '');
-      logToClient(`🚀 Đang kích hoạt ${batchFileSets.length} luồng ghép video (tối đa 5 luồng/lượt song song, 1-1 -> ${batchFileSets.length}-${batchFileSets.length})...`, 'info');
 
       // Respond immediately (<100ms) so Cloudflare's 100-second HTTP proxy timeout (Error 524) NEVER interrupts the client UI!
       res.json({
@@ -1266,7 +1266,7 @@ app.post('/api/render', async (req, res) => {
     .filter(p => p === 'KEEP_TEMPLATE_ORIGINAL' || (p && fs.existsSync(p)));
 
   if (validPaths.length === 0) {
-    return res.status(400).json({ success: false, error: 'Đại ca chưa tải lên hoặc chọn video/ảnh nguyên liệu nào!' });
+    return res.status(400).json({ success: false, error: 'Vui lòng tải lên hoặc chọn video/ảnh nguyên liệu trước!' });
   }
 
   const totalBatches = Math.max(1, Math.min(10, parseInt(batchCount, 10) || 1));
@@ -1862,7 +1862,7 @@ app.get('/api/download/:filename', (req, res) => {
         downloadedAt: Date.now()
       };
       saveOutputsState();
-      logToClient(`✅ Đã tải "${safeFilename}" về máy (Giữ bản dự phòng trên Server 5 phút phòng khi đại ca cần tải lại).`, 'success');
+      logToClient(`✅ Đã tải "${safeFilename}" về máy.`, 'success');
       broadcast('output_status_changed', { filename: rawName, downloaded: true, onServer: true });
       scheduleSafeServerCleanup(fullPath, rawName, 5 * 60 * 1000);
     }
